@@ -60,8 +60,8 @@ def _num_submissions(num_prompts, gen_batch_size):
 
 
 def _steps_per_epoch(dataset_size, train_batch_size):
-    """Standalone copy of ``PPOTrainer.steps_per_epoch``. ``//`` matches dataloader drop_last=True."""
-    return dataset_size // train_batch_size
+    """Standalone copy of ``PPOTrainer.steps_per_epoch`` with final-batch padding."""
+    return (dataset_size + train_batch_size - 1) // train_batch_size
 
 
 class TestResolveNumPrompts:
@@ -133,9 +133,9 @@ class TestStepsPerEpoch:
     def test_exact_division(self):
         assert _steps_per_epoch(dataset_size=10240, train_batch_size=1024) == 10
 
-    def test_drop_last_truncates_partial_batch(self):
-        # 10500 // 1024 == 10 (the trailing partial train batch is dropped, matching drop_last=True).
-        assert _steps_per_epoch(dataset_size=10500, train_batch_size=1024) == 10
+    def test_partial_batch_is_retained(self):
+        # The final partial batch is padded by the trainer and therefore forms a PPO update.
+        assert _steps_per_epoch(dataset_size=10500, train_batch_size=1024) == 11
 
     def test_independent_of_gen_batch_size(self):
         # steps_per_epoch must NOT depend on gen_batch_size; only on dataset size / train_batch_size.

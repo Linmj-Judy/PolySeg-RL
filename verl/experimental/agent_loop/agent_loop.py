@@ -48,6 +48,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.ppo.polyseg import BudgetedPolySegController, PolySegConfig
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.import_utils import resolve_config_path
@@ -74,6 +75,31 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+# PolySeg metadata has two ragged axes: token-aligned ``segment_ids`` and
+# macro-aligned fields.  Keep this schema in one place so legacy, v1, and
+# TransferQueue adapters use the same names and dtypes.
+POLYSEG_METADATA_DTYPES = {
+    "segment_rewards": torch.float32,
+    "segment_ids": torch.long,
+    "segment_durations": torch.float32,
+    "segment_mask": torch.long,
+    "segment_feedback_mask": torch.long,
+    "segment_features": torch.float32,
+    "segment_next_features": torch.float32,
+    "segment_transition_mask": torch.long,
+}
+
+
+def _polyseg_metadata_value(extra_fields: dict[str, Any], key: str):
+    """Return rollout metadata from direct or nested reward fields."""
+    value = extra_fields.get(key)
+    if value is not None:
+        return value
+    reward_info = extra_fields.get("reward_extra_info")
+    if isinstance(reward_info, dict):
+        return reward_info.get(key)
+    return None
 
 
 class AgentLoopMetrics(BaseModel):
@@ -140,12 +166,65 @@ class AgentLoopOutput(BaseModel):
             aligned[:num_rows] = routed_experts[:num_rows]
             output["routed_experts"] = aligned
 
+        # Promote rollout-owned PolySeg metadata before reward handling. The
+        # actor loss must consume these ids exactly as produced by rollout; it
+        # must never infer event boundaries from token counts.
+        segment_ids = _polyseg_metadata_value(self.extra_fields, "segment_ids")
+        if segment_ids is not None:
+            segment_ids = np.array(segment_ids, copy=True).reshape(-1)
+            response_length = output["responses"].numel()
+            if segment_ids.size != response_length:
+                raise ValueError(
+                    "rollout segment_ids must be token-aligned with responses: "
+                    f"got {segment_ids.size} ids for {response_length} response tokens"
+                )
+            output["segment_ids"] = torch.as_tensor(segment_ids, dtype=torch.long)
+
         # rm_scores: reward score for each token
         reward_score = output.pop("reward_score", None)
         if reward_score is not None:
             rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
-            rm_scores[-1] = reward_score
+            reward_extra_info = self.extra_fields.get("reward_extra_info", {})
+            segment_rewards = _polyseg_metadata_value(self.extra_fields, "segment_rewards")
+            segment_ids = _polyseg_metadata_value(self.extra_fields, "segment_ids")
+            if segment_rewards is not None and segment_ids is not None:
+                segment_rewards = torch.as_tensor(np.array(segment_rewards, copy=True), dtype=rm_scores.dtype)
+                segment_ids = torch.as_tensor(np.array(segment_ids, copy=True), dtype=torch.long)
+                action_mask = output["response_mask"].to(torch.bool)
+                for segment_id in range(segment_rewards.numel()):
+                    positions = torch.nonzero((segment_ids == segment_id) & action_mask, as_tuple=False).flatten()
+                    if positions.numel():
+                        rm_scores[int(positions[-1])] = segment_rewards[segment_id]
+            else:
+                rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
+
+            # The transfer-queue (v1) trainer receives the reward result through
+            # ``extra_fields`` because the asynchronous AgentLoop computes the
+            # score after the rollout tensor is created.  Promote PolySeg's
+            # ragged macro metadata to tensor fields as well, so downstream
+            # advantage computation can request it directly from the queue.
+            # Keeping the original nested copy in ``extra_fields`` preserves
+            # compatibility with validation/logging consumers.
+            if isinstance(reward_extra_info, dict):
+                for key, dtype in POLYSEG_METADATA_DTYPES.items():
+                    value = _polyseg_metadata_value(self.extra_fields, key)
+                    if value is None:
+                        continue
+                    # Copy NumPy views before conversion: reward managers often
+                    # return arrays backed by a read-only transport buffer.
+                    if isinstance(value, np.ndarray):
+                        value = np.array(value, copy=True)
+                    output[key] = torch.as_tensor(value, dtype=dtype)
+
+        # Promote direct rollout metadata too, including asynchronous reward
+        # results that are not present when the output object is first built.
+        for key, dtype in POLYSEG_METADATA_DTYPES.items():
+            value = _polyseg_metadata_value(self.extra_fields, key)
+            if value is None:
+                continue
+            value = np.array(value, copy=True) if isinstance(value, np.ndarray) else value
+            output[key] = torch.as_tensor(value, dtype=dtype)
 
         # Mutating a default dict does not add the field to Pydantic's fields-set,
         # so model_dump(exclude_unset=True) can omit populated extra fields.
@@ -450,6 +529,32 @@ class AgentLoopBase(ABC):
             assistant_logprobs=assistant_logprobs,
         )
         return merge_result, aligned_response_mask, aligned_response_logprobs
+
+    @staticmethod
+    def align_segment_ids(merge_result, segment_ids: list[int], segment_id: int) -> list[int]:
+        """Keep rollout-owned segment ids aligned with Continuous Token edits.
+
+        Tool/context tokens are assigned to the assistant action segment that
+        caused the tool call.  This makes a segment span action, tool call and
+        observation while ``response_mask`` still excludes observations from
+        the actor loss.
+        """
+
+        aligned = list(segment_ids)
+        # A few downstream integrations provide a lightweight merge result
+        # object in tests or custom agent loops.  The production
+        # ``MergeResult`` always has these fields; when an integration omits
+        # them, leave its existing metadata untouched instead of fabricating
+        # token alignment from the full runtime sequence.
+        if not hasattr(merge_result, "appended_token_count"):
+            return aligned
+        removed = int(getattr(merge_result, "removed_prefix_token_count", 0))
+        if removed:
+            aligned = aligned[: -removed]
+        inserted = getattr(merge_result, "inserted_token_ids", ())
+        aligned += [segment_id] * len(inserted)
+        aligned += [segment_id] * int(merge_result.appended_token_count)
+        return aligned
 
     def _cap_text_prompt_length(self, prompt_ids: list[int]) -> list[int]:
         prompt_length = self.rollout_config.prompt_length
@@ -836,7 +941,7 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
-        await self._compute_score([output], kwargs=kwargs)
+        await self._compute_score([output], kwargs={**kwargs, "validate": bool(validate)})
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -1020,6 +1125,11 @@ class AgentLoopWorker:
                         "attention_mask": torch.nn.utils.rnn.pad_sequence(
                             all_attention_mask, batch_first=True, padding_value=0
                         ),
+                        "response_mask": torch.nn.utils.rnn.pad_sequence(
+                            [torch.as_tensor(output.response_mask, dtype=torch.long) for output in outputs],
+                            batch_first=True,
+                            padding_value=0,
+                        ),
                         "input_ids": torch.nn.utils.rnn.pad_sequence(all_input_ids, batch_first=True, padding_value=0),
                         "position_ids": torch.nn.utils.rnn.pad_sequence(
                             all_position_ids, batch_first=True, padding_value=0
@@ -1093,6 +1203,29 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+
+        # Preserve the rollout-owned token boundary schema in the legacy batch.
+        # Pad only the right edge; ``-1`` remains the canonical id for response
+        # padding/observation positions and is never used to infer boundaries.
+        raw_segment_ids = []
+        missing_segment_ids = False
+        for input_item in inputs:
+            value = _polyseg_metadata_value(input_item.extra_fields, "segment_ids")
+            if value is None:
+                missing_segment_ids = True
+                continue
+            ids = torch.as_tensor(np.array(value, copy=True), dtype=torch.long).flatten()
+            if ids.numel() > response_mask.shape[1]:
+                raise ValueError("rollout segment_ids cannot exceed the padded response width")
+            padded = torch.full((response_mask.shape[1],), -1, dtype=torch.long)
+            padded[: ids.numel()] = ids
+            raw_segment_ids.append(padded)
+        if missing_segment_ids:
+            if raw_segment_ids:
+                raise ValueError("PolySeg segment_ids must be present for every sample in a legacy batch")
+        elif raw_segment_ids:
+            optional_outputs["segment_ids"] = torch.stack(raw_segment_ids, dim=0)
+
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1109,23 +1242,61 @@ class AgentLoopWorker:
 
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):
-            prompt_length = prompt_ids.size(1)
-            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+            for row, (score, input_item) in enumerate(zip(scores, inputs, strict=True)):
+                reward_info = input_item.extra_fields.get("reward_extra_info", {})
+                segment_rewards = reward_info.get("segment_rewards") if isinstance(reward_info, dict) else None
+                segment_ids = reward_info.get("segment_ids") if isinstance(reward_info, dict) else None
+                if segment_rewards is not None and segment_ids is not None:
+                    reward_values = torch.as_tensor(np.array(segment_rewards, copy=True), dtype=rm_scores.dtype)
+                    ids = torch.as_tensor(np.array(segment_ids, copy=True), dtype=torch.long)
+                    actions = response_mask[row].to(torch.bool)
+                    if ids.numel() < actions.numel():
+                        padded_ids = torch.full((actions.numel(),), -1, dtype=torch.long)
+                        padded_ids[: ids.numel()] = ids
+                        ids = padded_ids
+                    else:
+                        ids = ids[: actions.numel()]
+                    for segment_id in range(reward_values.numel()):
+                        positions = torch.nonzero((ids == segment_id) & actions, as_tuple=False).flatten()
+                        if positions.numel():
+                            rm_scores[row, int(positions[-1])] = reward_values[segment_id]
+                else:
+                    response_length = attention_mask[row, prompt_ids.size(1) :].sum() - 1
+                    rm_scores[row, int(response_length)] = float(score)
             batch["rm_scores"] = rm_scores
 
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
+        # Keep explicit tool accounting as numeric batch fields so the
+        # trainer's common metric reducer can report it on every full run.
+        non_tensor_batch["tool_call_counts"] = np.asarray(
+            [int(input.extra_fields.get("tool_call_count", 0) or 0) for input in inputs], dtype=np.int32
+        )
+        non_tensor_batch["tool_call_success_counts"] = np.asarray(
+            [int(input.extra_fields.get("tool_call_success_count", 0) or 0) for input in inputs], dtype=np.int32
+        )
+        non_tensor_batch["tool_call_failure_counts"] = np.asarray(
+            [int(input.extra_fields.get("tool_call_failure_count", 0) or 0) for input in inputs], dtype=np.int32
+        )
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
-        # add reward_extra_info to non_tensor_batch
+        # Add reward extras using a 1-D object array for ragged PolySeg
+        # metadata.  ``np.array`` would either collapse equal-shaped nested
+        # values or raise on mixed segment counts, producing backend-specific
+        # schemas before the actor ever sees the batch.
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = sorted({key for info in reward_extra_infos if isinstance(info, dict) for key in info})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = [info.get(key) if isinstance(info, dict) else None for info in reward_extra_infos]
+            if key in POLYSEG_METADATA_DTYPES:
+                value_array = np.empty(len(values), dtype=object)
+                value_array[:] = [np.array(value, copy=True) if isinstance(value, np.ndarray) else value for value in values]
+                non_tensor_batch[key] = value_array
+            else:
+                non_tensor_batch[key] = np.array(values)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -1211,8 +1382,128 @@ class AgentLoopManager:
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
+        # The adaptive selector is deliberately driver-side. Rollout workers
+        # process chunks independently, so a worker-local ledger would multiply
+        # the configured feedback budget by the worker count.
+        self.polyseg_controller: BudgetedPolySegController | None = None
+        if bool(getattr(self.rollout_config, "polyseg_adaptive", False)):
+            selector_config = PolySegConfig.from_any(getattr(config, "algorithm", None))
+            # Algorithm config is canonical; rollout aliases are accepted for
+            # launcher-only overrides when the nested algorithm value keeps
+            # its backward-compatible default.
+            rollout_compute_cost = getattr(self.rollout_config, "polyseg_critic_compute_cost", None)
+            rollout_compute_budget = getattr(self.rollout_config, "polyseg_compute_budget", None)
+            critic_compute_cost = selector_config.critic_compute_cost
+            if critic_compute_cost == 0.0 and rollout_compute_cost not in (None, 0, 0.0):
+                critic_compute_cost = float(rollout_compute_cost)
+            compute_budget = selector_config.compute_budget
+            if compute_budget is None and rollout_compute_budget is not None:
+                compute_budget = float(rollout_compute_budget)
+            self.polyseg_controller = BudgetedPolySegController(
+                q_candidates=getattr(self.rollout_config, "polyseg_q_candidates", [0, 1, 2, 4]),
+                m_candidates=getattr(self.rollout_config, "polyseg_m_candidates", [1, 2, 4, 8]),
+                total_budget=getattr(self.rollout_config, "polyseg_total_budget", None),
+                segment_cost=float(getattr(self.rollout_config, "polyseg_segment_cost", 1.0)),
+                selector_norm=str(getattr(self.rollout_config, "polyseg_selector_norm", "effective_round")),
+                budget_fallback=str(getattr(self.rollout_config, "polyseg_budget_fallback", "error")),
+                dependence_chi=selector_config.dependence_chi,
+                stat_exponent_u=selector_config.stat_exponent_u,
+                approx_exponent_v=selector_config.approx_exponent_v,
+                segment_exponent_gamma=selector_config.segment_exponent_gamma,
+                stat_constant=selector_config.stat_constant,
+                approx_constant=selector_config.approx_constant,
+                segment_constant=selector_config.segment_constant,
+                r_max=selector_config.r_max,
+                cost_penalty=selector_config.cost_penalty,
+                critic_compute_cost=critic_compute_cost,
+                compute_budget=compute_budget,
+            )
+
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
+
+    def _prepare_polyseg_adaptive(self, prompts, *, validate: bool = False):
+        """Choose and attach one adaptive pair to a rollout batch.
+
+        Both the DataProto and TransferQueue managers use this hook.  The
+        latter passes a TensorDict, so scalar metadata is wrapped with the
+        TensorDict non-tensor helpers rather than assigned as a NumPy array.
+        """
+        if self.polyseg_controller is None:
+            return None
+        if validate:
+            # Freeze segmentation to the last training choice. Evaluation
+            # batch size and labels must not alter selector state or budget.
+            from types import SimpleNamespace
+
+            previous = self.polyseg_controller.last_choice
+            choice = SimpleNamespace(
+                q=previous.q if previous is not None else min(self.polyseg_controller.q_candidates),
+                m=previous.m if previous is not None else min(self.polyseg_controller.m_candidates),
+                compute_cost=previous.compute_cost if previous is not None else 0.0,
+                fallback="none", fallback_reason="",
+            )
+        else:
+            choice = self.polyseg_controller.choose(
+                episodes=max(1, len(prompts)),
+                horizon=max(1, int(getattr(self.rollout_config, "response_length", 1))),
+                feature_dim=max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4))),
+                feedback=str(getattr(self.rollout_config, "polyseg_feedback", "sum")),
+            )
+        episodes = max(1, len(prompts))
+        values = {
+            "polyseg_adaptive_q": choice.q,
+            "polyseg_adaptive_m": choice.m,
+            "polyseg_adaptive_planned_cost": (
+                0.0
+                if choice.fallback == "skip"
+                else choice.m * self.polyseg_controller.segment_cost
+            ),
+            # Selector choices report batch totals; transport the per-
+            # trajectory amount so reward-worker accounting can sum rows
+            # without multiplying the same batch cost twice.
+            "polyseg_adaptive_compute_cost": float(choice.compute_cost) / episodes,
+            # This is the pre-observation ledger value. The trainer replaces
+            # it with the post-observation value once reward cost is known.
+            "polyseg_adaptive_remaining_budget": self.polyseg_controller.remaining_budget,
+            "polyseg_adaptive_fallback": choice.fallback,
+            "polyseg_adaptive_fallback_reason": choice.fallback_reason,
+        }
+        if hasattr(prompts, "non_tensor_batch"):
+            n = len(prompts)
+            prompts.non_tensor_batch.update(
+                {
+                    "polyseg_adaptive_q": np.full(n, choice.q, dtype=np.int64),
+                    "polyseg_adaptive_m": np.full(n, choice.m, dtype=np.int64),
+                    "polyseg_adaptive_planned_cost": np.full(
+                        n, values["polyseg_adaptive_planned_cost"], dtype=np.float32
+                    ),
+                    "polyseg_adaptive_compute_cost": np.full(
+                        n, values["polyseg_adaptive_compute_cost"], dtype=np.float32
+                    ),
+                    "polyseg_adaptive_remaining_budget": np.full(
+                        n,
+                        np.nan if values["polyseg_adaptive_remaining_budget"] is None else values["polyseg_adaptive_remaining_budget"],
+                        dtype=np.float32,
+                    ),
+                    "polyseg_adaptive_fallback": np.full(n, choice.fallback, dtype=object),
+                    "polyseg_adaptive_fallback_reason": np.full(n, choice.fallback_reason, dtype=object),
+                }
+            )
+        else:
+            from verl.utils import tensordict_utils as tu
+
+            for key, value in values.items():
+                tu.assign_non_tensor_stack(prompts, key, [value] * len(prompts))
+        # For validation this is a snapshot used only for segmentation;
+        # generate_sequences must not observe its held-out query costs.
+        return choice
+
+    def observe_polyseg_cost(self, actual_cost: float, *, compute_cost: float = 0.0, episodes: int = 1):
+        """Update the shared adaptive ledger from measured verifier cost."""
+        if self.polyseg_controller is None:
+            return None
+        return self.polyseg_controller.observe(float(actual_cost), compute_cost=float(compute_cost), episodes=episodes)
 
     @classmethod
     @auto_await
@@ -1261,6 +1552,9 @@ class AgentLoopManager:
         if "priority" not in prompts.non_tensor_batch:
             prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
 
+        validate = bool(prompts.meta_info.get("validate", False))
+        adaptive_choice = self._prepare_polyseg_adaptive(prompts, validate=validate)
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
@@ -1275,6 +1569,32 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        output.meta_info["validate"] = validate
+        if adaptive_choice is not None and not validate:
+            # Cost is updated from the reward result below, after all workers
+            # have completed.  Planned and actual cost intentionally remain
+            # separate; terminal feedback may query fewer segments than m.
+            actual = output.non_tensor_batch.get("segment_query_cost")
+            actual_total = 0.0
+            if actual is not None:
+                try:
+                    values = np.asarray(actual, dtype=np.float64).reshape(-1)
+                    actual_total = float(values[np.isfinite(values)].sum())
+                except (TypeError, ValueError):
+                    actual_total = 0.0
+            remaining = self.observe_polyseg_cost(actual_total, episodes=len(output))
+            if remaining is not None:
+                output.non_tensor_batch["polyseg_adaptive_remaining_budget"] = np.full(
+                    len(output), remaining, dtype=np.float32
+                )
+            output.meta_info["polyseg_adaptive_choice"] = {
+                "q": adaptive_choice.q,
+                "m": adaptive_choice.m,
+                "query_cost": adaptive_choice.query_cost,
+                "planned_batch_cost": adaptive_choice.query_cost,
+                "actual_batch_cost": actual_total,
+                "remaining_budget": remaining,
+            }
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

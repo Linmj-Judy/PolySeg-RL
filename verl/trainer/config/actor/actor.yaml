@@ -79,6 +79,10 @@ policy_loss:
   # Must be set to a positive value when policy_loss.loss_mode is "dro".
   dro_beta: null
 
+# Maximum macro segment axis used for PolySeg tensor padding. Rollout-owned
+# segment_ids are still required; this value never defines event boundaries.
+polyseg_num_segments: 4
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

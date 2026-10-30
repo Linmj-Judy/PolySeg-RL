@@ -12,6 +12,27 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+# Extra options passed to reward managers. PolySeg uses m, feedback, budget
+# and segment_cost; DAPO may use its overlong buffer options here as well.
+reward_kwargs:
+  m: null
+  feature_dim: null
+  feedback: sum
+  budget: null
+  # trajectory resets the ledger for each sample; global keeps B_K across
+  # concurrent reward-loop calls and is used by full training runs.
+  budget_scope: trajectory
+  segment_cost: 1.0
+  # Shared JSON ledger used when global budgets span independent Ray workers.
+  # Full-run launchers set this to an attempt-local path; leaving it null is
+  # allowed only for a single in-process reward worker.
+  feedback_ledger_path: null
+  # error aborts on exhausted budget; skip records an explicit missing-feedback fallback.
+  budget_fallback: error
+  # Agentic runs must consume segment ids from AgentLoop. Set false only for
+  # the legacy fixed-token smoke path.
+  require_rollout_segments: false
+
 # reward manager, see `verl/trainer/config/reward_manager.yaml` for details.
 reward_manager:
   _target_: verl.workers.config.reward.RewardManagerConfig

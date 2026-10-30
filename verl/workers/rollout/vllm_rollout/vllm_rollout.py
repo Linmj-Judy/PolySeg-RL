@@ -137,7 +137,10 @@ class ServerAdapter(BaseRollout):
         # verl jobs on the same host (or a new run after a crashed one with a
         # stale socket file) cannot collide on the shared /tmp namespace.
         local_rank = self.rollout_rank % local_world_size
-        job_id = ray.get_runtime_context().get_job_id()
+        # The short local-Ray job id is reused by independent local clusters.
+        # run_matrix supplies a stable per-run namespace so concurrent jobs
+        # cannot connect to each other's /tmp IPC sockets.
+        job_id = os.environ.get("VERL_RAY_JOB_ID") or ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
         self.use_shm = not is_support_ipc()

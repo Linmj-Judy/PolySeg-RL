@@ -279,7 +279,7 @@ class vLLMPDReplica(vLLMReplica):
             # Avoid Mooncake TCP port exhaustion under validation concurrency.
             "MC_TCP_ENABLE_CONNECTION_POOL": os.environ.get("MC_TCP_ENABLE_CONNECTION_POOL", "1"),
             "VERL_ZMQ_BASE_TRAINER_RANK": str(zmq_base_trainer_rank),
-            "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
+            "VERL_RAY_JOB_ID": os.environ.get("VERL_RAY_JOB_ID", ray.get_runtime_context().get_job_id()),
         }
 
         return self.server_class.options(

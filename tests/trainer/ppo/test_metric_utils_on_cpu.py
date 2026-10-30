@@ -16,6 +16,7 @@ Tests for the metric utilities in verl.trainer.ppo.metric_utils.
 """
 
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -567,6 +568,39 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
+
+    def test_process_validation_metrics_preserves_structured_reward_diagnostics(self):
+        """PolySeg reward extras must not crash or change scalar accuracy statistics."""
+        infos_dict = {
+            "acc": [np.float32(1.0), 0.0],
+            "segment_count": [np.int64(2), 3],
+            "indicator": [np.bool_(True), False],
+            "scalar_array": [np.array(1.0), np.array(0.0)],
+            "optional": [None, 0.5],
+            "segment_info": [[{"reward": 0.0}, {"reward": 1.0}], [{"reward": 0.0}]],
+            "segment_rewards": [np.array([0.0, 1.0]), np.array([0.0])],
+            "segment_features": [np.ones((2, 4)), np.zeros((3, 4))],
+            "singleton_vector": [[1.0], [0.0]],
+            "metadata": [{"score": 1.0}, {"score": 0.0}],
+            "numeric_first_mixed": [1.0, {"score": 0.0}],
+            "string_first_mixed": ["unknown", 0.0],
+            "empty_vector": [[], []],
+            "missing": [None, None],
+            "pred": ["A", "B"],
+        }
+        original = deepcopy(infos_dict)
+        result = process_validation_metrics(["gsm8k"] * 2, ["prompt"] * 2, infos_dict)
+        metrics = result["gsm8k"]
+        self.assertEqual(set(metrics), {"acc", "segment_count", "indicator", "scalar_array", "optional"})
+        self.assertAlmostEqual(metrics["acc"]["mean@2"], 0.5)
+        self.assertAlmostEqual(metrics["segment_count"]["mean@2"], 2.5)
+        self.assertAlmostEqual(metrics["indicator"]["mean@2"], 0.5)
+        self.assertAlmostEqual(metrics["scalar_array"]["mean@2"], 0.5)
+        self.assertAlmostEqual(metrics["optional"]["mean@1"], 0.5)
+        self.assertIn("maj@2/mean", metrics["acc"])
+        self.assertEqual(infos_dict["segment_info"], original["segment_info"])
+        for actual, expected in zip(infos_dict["segment_rewards"], original["segment_rewards"], strict=True):
+            np.testing.assert_array_equal(actual, expected)
 
     def test_process_validation_metrics_counts_missing_sessions_as_incorrect(self):
         data_sources = ["source1", "source1"]

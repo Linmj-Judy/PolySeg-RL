@@ -38,6 +38,46 @@ prompt_length: ${oc.select:data.max_prompt_length,512}
 # same as data.max_response_length if it exists
 response_length: ${oc.select:data.max_response_length,512}
 
+# Fixed-token PolySeg segmentation for single-turn rollouts. Keep zero for
+# the default one-segment path; tool-agent loops provide their own boundaries.
+polyseg_fixed_m: 0
+
+# Enable an online finite (q,m) selection for rollout batches.
+polyseg_adaptive: false
+
+# Candidate polynomial orders for the adaptive selector.
+polyseg_q_candidates: [0, 1, 2, 4]
+
+# Candidate segment counts for the adaptive selector.
+polyseg_m_candidates: [1, 2, 4, 8]
+
+# Optional total verifier/suffix budget consumed by the adaptive selector.
+polyseg_total_budget: null
+
+# Query cost used by the adaptive selector's planning bound.
+polyseg_segment_cost: 1.0
+
+# Optional declared critic-side compute cost per polynomial feature and
+# observed segment; kept separate from verifier/suffix feedback cost.
+polyseg_critic_compute_cost: 0.0
+
+# Optional cumulative critic-compute budget for adaptive selection.
+polyseg_compute_budget: null
+
+# Adaptive selector normalization. effective_round uses the conservative
+# K*m/(kappa_seg^U*kappa_tr^U) convention; power is compatibility-only.
+polyseg_selector_norm: effective_round
+
+# Controller behavior when the remaining budget cannot fund a whole batch.
+# error is fail-closed; skip records missing feedback without querying.
+polyseg_budget_fallback: error
+
+# Feedback protocol used by the adaptive selector.
+polyseg_feedback: sum
+
+# Frozen feature width used for candidate feasibility.
+polyseg_feature_dim: 4
+
 # for vllm rollout
 # Rollout model parameters type. Align with actor model's FSDP/Megatron type.
 dtype: bfloat16

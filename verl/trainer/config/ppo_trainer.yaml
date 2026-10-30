@@ -77,6 +77,111 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
+  # PolySeg-RL macro feedback and Legendre critic configuration.
+  polyseg:
+
+    # Required when using omega_conf_to_dataclass to instantiate the config.
+    _target_: verl.trainer.config.PolySegAlgorithmConfig
+
+    # Highest Legendre polynomial degree.
+    q: 2
+
+    # Number of segments per trajectory.
+    m: 4
+
+    # Frozen low-dimensional feature dimension.
+    feature_dim: 4
+
+    # Fixed response horizon used by the macro feature map.
+    feature_horizon: null
+
+    # Fit a frozen-basis ridge/logistic macro critic from macro return targets
+    # before computing duration-aware macro GAE.
+    use_polynomial_critic: False
+
+    # Critic family: polynomial (default) or the small nonlinear MLP baseline.
+    critic_type: polynomial
+    mlp_hidden_dim: 32
+    mlp_learning_rate: 0.05
+    mlp_steps: 100
+
+    # Macro reward-to-go target for the frozen polynomial critic.  Set to
+    # ``value`` only to reproduce the pre-target implementation.
+    polynomial_target: return
+
+    # Feature basis: total or additive.
+    basis: total
+
+    # Whether to use orthonormal one-dimensional Legendre scaling.
+    normalized_basis: False
+
+    # Feedback protocol: sum or binary.
+    feedback: sum
+
+    # Ridge regularization for sum feedback.
+    ridge_lambda: 1.0
+
+    # L2 regularization for binary feedback.
+    logistic_l2: 1.0
+
+    # Whiten macro advantages before scattering to tokens.
+    normalize_advantages: True
+
+    # Add ridge confidence bonuses to macro rewards when enabled.
+    use_confidence_bonus: False
+
+    # Reward-side confidence multiplier.
+    reward_confidence_beta: 1.0
+
+    # Transition-side confidence multiplier for explicit macro backups.
+    transition_confidence_beta: 1.0
+
+    # Fit an explicit macro transition operator when boundary features are
+    # available.  Keep disabled for ordinary LLM rollouts without state
+    # transitions; the return critic remains the honest fallback there.
+    use_transition_estimator: False
+
+    # Ridge regularization for the vector-valued transition estimator.
+    transition_ridge_lambda: 1.0
+
+    # Number of reward/transition Bellman refits per batch.
+    transition_backup_iterations: 1
+
+    # Weight critic observations by rollout-owned segment duration.  Use
+    # ``uniform`` for equal-weight ablations.
+    critic_weighting: duration
+
+    # Accumulate polynomial ridge sufficient statistics across trainer batches.
+    accumulate_estimator: False
+
+    # Optional key used by the process-local fallback registry.  v1 trainers
+    # pass an explicit checkpointable state object and do not need this key.
+    estimator_state_id: ""
+
+    # Query cost used by the budget ledger.
+    segment_cost: 1.0
+
+    # Optional total feedback budget.
+    budget: null
+
+    # Optional declared critic-side compute cost per polynomial feature and
+    # observed segment, separate from verifier/suffix feedback cost.
+    critic_compute_cost: 0.0
+
+    # Optional cumulative critic-compute budget for adaptive selection.
+    compute_budget: null
+
+    # Theory-bound constants exposed for reproducible (q,m) selection.
+    smoothness_s: 2.0
+    stat_exponent_u: 1.0
+    approx_exponent_v: 1.0
+    segment_exponent_gamma: 1.0
+    dependence_chi: 1.0
+    stat_constant: 1.0
+    approx_constant: 1.0
+    segment_constant: 1.0
+    cost_penalty: 0.0
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 

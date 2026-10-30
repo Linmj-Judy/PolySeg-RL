@@ -18,6 +18,7 @@ Metrics related to the PPO trainer.
 import logging
 from collections import defaultdict
 from functools import partial
+from numbers import Real
 from typing import Any, Callable
 
 import numpy as np
@@ -34,6 +35,15 @@ from verl.utils.model import update_model_config
 logger = logging.getLogger(__name__)
 
 _NUM_LOCAL_EXPERTS_MODEL_TYPES = {"gpt_oss", "mixtral"}
+
+
+def _coerce_validation_metric_value(value: Any) -> Real | None:
+    """Accept real scalar metrics; structured reward diagnostics have no implicit reduction."""
+    if isinstance(value, (Real, np.bool_)):
+        return value
+    if isinstance(value, np.ndarray) and value.ndim == 0 and value.dtype.kind in "biuf":
+        return value.item()
+    return None
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -599,11 +609,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
 
-    if "tool_call_counts" in batch.non_tensor_batch:
-        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
+    if "tool_call_counts" in batch.non_tensor_batch or "tool_call_count" in batch.non_tensor_batch:
+        tool_call_counts = batch.non_tensor_batch.get("tool_call_counts")
+        if tool_call_counts is None:
+            tool_call_counts = batch.non_tensor_batch["tool_call_count"]
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+    if "tool_call_success_counts" in batch.non_tensor_batch or "tool_call_success_count" in batch.non_tensor_batch:
+        successes = batch.non_tensor_batch.get("tool_call_success_counts")
+        if successes is None:
+            successes = batch.non_tensor_batch["tool_call_success_count"]
+        metrics["tool_call_success_counts/mean"] = successes.mean()
+    if "tool_call_failure_counts" in batch.non_tensor_batch or "tool_call_failure_count" in batch.non_tensor_batch:
+        failures = batch.non_tensor_batch.get("tool_call_failure_counts")
+        if failures is None:
+            failures = batch.non_tensor_batch["tool_call_failure_count"]
+        metrics["tool_call_failure_counts/mean"] = failures.mean()
 
     return metrics
 
@@ -912,6 +934,9 @@ def process_validation_metrics(
         data_sources: List of data source identifiers for each sample.
         sample_uids: List of sample uids corresponding to each sample.
         infos_dict: Dictionary mapping variable names to lists of values for each sample.
+            Only real numeric scalars (including booleans and zero-dimensional NumPy
+            arrays) are aggregated. Structured diagnostics are left unchanged for callers
+            that also save them to JSONL; vectors need explicitly named scalar summaries.
         seed: Random seed for bootstrap sampling. Defaults to 42.
         expected_acc_counts: Expected session count keyed by ``(data_source, uid)``. For data
             sources that emit ``acc``, failure sessions are included with ``acc=0`` while
@@ -1003,8 +1028,11 @@ def process_validation_metrics(
 
             for var_name, var_vals in var2vals.items():
                 var_vals = [value for value in var_vals if value is not None]
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Check every observation: reward extras can contain variable-length
+                # segment vectors, dictionaries, or mixed metadata. Do not silently
+                # drop only the nonnumeric observations and bias the reported mean.
+                var_vals = [_coerce_validation_metric_value(value) for value in var_vals]
+                if not var_vals or any(value is None for value in var_vals):
                     continue
                 has_pred = (
                     pred_vals is not None

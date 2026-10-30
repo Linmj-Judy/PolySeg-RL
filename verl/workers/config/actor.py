@@ -159,6 +159,11 @@ class ActorConfig(BaseConfig):
     clip_ratio_high: float = 0.2
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+
+    # Maximum macro segment axis used for PolySeg tensor padding. Rollout-owned
+    # segment_ids are required and this value never defines event boundaries.
+    polyseg_num_segments: int = 4
+
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None

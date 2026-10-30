@@ -97,6 +97,10 @@ class RewardConfig(BaseConfig):
     # reward manager args
     num_workers: int = 8
     reward_manager: RewardManagerConfig = field(default_factory=RewardManagerConfig)
+    # Extra options consumed by reward managers.  PolySeg uses this mapping
+    # for the segment count, feedback protocol and query budget; keeping it on
+    # the shared config also preserves compatibility with DAPO's options.
+    reward_kwargs: dict = field(default_factory=dict)
 
     # reward model args
     reward_model: RewardModelConfig = field(default_factory=RewardModelConfig)

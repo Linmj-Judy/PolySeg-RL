@@ -16,8 +16,8 @@
 
 import pytest
 import torch
-
 from verl.trainer.ppo.core_algos import agg_loss
+from verl.workers.utils.losses import _count_valid_segments
 
 
 def test_token_sum_masks_tokens_and_scales_for_dp():
@@ -63,3 +63,12 @@ def test_token_sum_matches_global_sum_after_fsdp_mean_reduction(dp_size):
     global_sum = agg_loss(loss_mat, loss_mask, loss_agg_mode="token-sum")
 
     torch.testing.assert_close(fsdp_reduced, global_sum)
+
+
+def test_polyseg_macro_count_ignores_padding_and_observation_ids():
+    ids = torch.tensor([[0, 0, -1, 1], [0, -1, -1, -1]])
+    mask = torch.tensor([[True, True, False, True], [True, False, False, False]])
+
+    assert _count_valid_segments(ids, mask).item() == 3
+    feedback = torch.tensor([[True, False], [True, False]])
+    assert _count_valid_segments(ids, mask, feedback).item() == 2

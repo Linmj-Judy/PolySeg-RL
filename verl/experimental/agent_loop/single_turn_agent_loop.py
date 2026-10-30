@@ -16,13 +16,80 @@ import os
 from typing import Any
 from uuid import uuid4
 
+import torch
+
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.trainer.ppo.polyseg import build_segment_features, make_segment_slices
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def build_single_turn_segment_metadata(
+    response_mask: list[int],
+    configured_m: int = 0,
+    feature_dim: int = 4,
+    feature_horizon: int | None = None,
+) -> dict[str, Any]:
+    """Build fixed-token PolySeg metadata for one generated response.
+
+    ``response_mask`` is the action mask returned by the backend. Padding or
+    other non-policy tokens receive ``-1`` and are excluded from boundaries.
+    This pure helper keeps the rollout contract testable without starting a
+    vLLM server.
+    """
+
+    response_length = len(response_mask)
+    action_positions = [index for index, value in enumerate(response_mask) if bool(value)]
+    segment_count = (
+        min(int(configured_m), len(action_positions))
+        if int(configured_m) > 0 and action_positions
+        else (1 if action_positions else 0)
+    )
+    segment_ids = [-1] * response_length
+    boundaries: list[tuple[int, int]] = []
+    if action_positions:
+        for segment_id, (start, end) in enumerate(make_segment_slices(len(action_positions), segment_count)):
+            positions = action_positions[start:end]
+            for position in positions:
+                segment_ids[position] = segment_id
+            boundaries.append((positions[0], positions[-1] + 1))
+    # Single-turn fixed partitions have a rollout-owned successor feature for
+    # every nonterminal segment: the next observed segment boundary.  Expose
+    # it explicitly so the transition estimator can be run on this protocol
+    # without asking the reward manager to invent a shifted state.  The final
+    # segment is terminal and is masked out.
+    features = build_segment_features(
+        boundaries,
+        [1.0] * len(boundaries),
+        response_length=max(int(feature_horizon or response_length), 1),
+        action_lengths=[
+            sum(1 for position in action_positions if segment_ids[position] == segment_id)
+            for segment_id in range(len(boundaries))
+        ],
+        feature_dim=max(1, int(feature_dim)),
+    )
+    next_features = torch.zeros_like(features)
+    transition_mask = [False] * len(boundaries)
+    if len(boundaries) > 1:
+        next_features[:-1] = features[1:]
+        transition_mask[:-1] = [True] * (len(boundaries) - 1)
+    return {
+        "segment_ids": segment_ids,
+        "segment_durations": [1.0] * len(boundaries),
+        "segment_boundaries": boundaries,
+        "segment_action_lengths": [
+            sum(1 for position in action_positions if segment_ids[position] == segment_id)
+            for segment_id in range(len(boundaries))
+        ],
+        "segment_tool_calls": [[] for _ in boundaries],
+        "segment_tool_observations": [[] for _ in boundaries],
+        "segment_next_features": next_features.tolist(),
+        "segment_transition_mask": transition_mask,
+    }
 
 
 @register("single_turn_agent")
@@ -110,6 +177,45 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         # keeping the schema consistent with tool_agent_loop
-        output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
+        response_length = len(output.response_ids)
+        # Single-turn math rollouts have no environment boundary. For an
+        # explicit fixed-token PolySeg experiment, construct balanced
+        # boundaries over action tokens; otherwise retain one segment.
+        configured_m = kwargs.get("polyseg_adaptive_m", getattr(self.rollout_config, "polyseg_fixed_m", 0))
+        if hasattr(configured_m, "item"):
+            configured_m = configured_m.item()
+        configured_m = int(configured_m or 0)
+        metadata = build_single_turn_segment_metadata(
+            output.response_mask,
+            configured_m,
+            feature_dim=max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4))),
+            feature_horizon=self.response_length,
+        )
+        output.extra_fields.update(
+            {
+                **metadata,
+                "turn_scores": [],
+                "tool_rewards": [],
+                "trajectory_id": request_id,
+                "episode_id": request_id,
+                "segment_state_ids": [f"{request_id}:s{segment_id}" for segment_id in range(len(metadata["segment_boundaries"]))],
+                "segment_action_texts": [
+                    self.tokenizer.decode(output.response_ids[start:end], skip_special_tokens=False)
+                    for start, end in metadata["segment_boundaries"]
+                ],
+            }
+        )
+        for key in (
+            "polyseg_adaptive_q",
+            "polyseg_adaptive_m",
+            "polyseg_adaptive_planned_cost",
+            "polyseg_adaptive_compute_cost",
+            "polyseg_adaptive_remaining_budget",
+            "polyseg_adaptive_fallback",
+            "polyseg_adaptive_fallback_reason",
+        ):
+            if key in kwargs:
+                value = kwargs[key]
+                output.extra_fields[key] = value.item() if hasattr(value, "item") else value
 
         return output

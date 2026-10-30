@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -144,6 +145,48 @@ def test_agent_loop_output_as_dict_preserves_mutated_default_extra_fields():
     fields = output.as_dict()
 
     assert fields["extra_fields"] == {"raw_prompt": [{"role": "user", "content": "hello"}]}
+
+
+def test_agent_loop_output_as_dict_promotes_rollout_segment_ids_without_reward():
+    output = _make_agent_loop_output()
+    output.extra_fields["segment_ids"] = [0, 0]
+
+    fields = output.as_dict()
+
+    assert torch.equal(fields["segment_ids"], torch.tensor([0, 0]))
+
+
+def test_agent_loop_output_as_dict_rejects_misaligned_rollout_segment_ids():
+    output = _make_agent_loop_output()
+    output.extra_fields["segment_ids"] = [0]
+
+    with pytest.raises(ValueError, match="token-aligned"):
+        output.as_dict()
+
+
+def test_agent_loop_output_as_dict_promotes_polyseg_transition_metadata():
+    output = _make_agent_loop_output()
+    output.reward_score = 1.0
+    output.extra_fields["reward_extra_info"] = {
+        "segment_rewards": np.array([0.0, 1.0], dtype=np.float32),
+        "segment_ids": np.array([0, 1], dtype=np.int64),
+        "segment_durations": np.array([1.0, 2.0], dtype=np.float32),
+        "segment_mask": np.array([1, 1], dtype=np.int64),
+        "segment_feedback_mask": np.array([1, 0], dtype=np.int64),
+        "segment_features": np.ones((2, 4), dtype=np.float32),
+        "segment_next_features": np.zeros((2, 4), dtype=np.float32),
+        "segment_transition_mask": np.array([1, 0], dtype=np.bool_),
+    }
+
+    fields = output.as_dict()
+
+    assert torch.equal(fields["segment_ids"], torch.tensor([0, 1]))
+    assert fields["segment_features"].shape == (2, 4)
+    assert fields["segment_next_features"].shape == (2, 4)
+    assert fields["segment_transition_mask"].dtype == torch.long
+    assert torch.equal(fields["segment_feedback_mask"], torch.tensor([1, 0]))
+    # Keep the nested form for validation and reward logging consumers.
+    assert "reward_extra_info" in fields["extra_fields"]
 
 
 def test_agent_loop_output_as_dict_promotes_teacher_fields_without_mutating_model():
@@ -402,6 +445,49 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+    assert int(merged.non_tensor_batch["tool_call_counts"][0]) == 0
+    assert int(merged.non_tensor_batch["tool_call_success_counts"][0]) == 0
+    assert int(merged.non_tensor_batch["tool_call_failure_counts"][0]) == 0
+
+
+def test_agent_loop_postprocess_keeps_ragged_polyseg_rows_as_objects():
+    metrics = AgentLoopMetrics()
+    inputs = [
+        _to_internal(
+            output_prompt_ids=[1],
+            output_response_ids=[2, 3],
+            output_response_mask=[1, 1],
+            metrics=metrics,
+            extra_fields={
+                "segment_ids": [0, 0],
+                "reward_extra_info": {"segment_rewards": np.array([1.0], dtype=np.float32)},
+            },
+            num_turns=2,
+            prompt_len=1,
+            response_len=4,
+        ),
+        _to_internal(
+            output_prompt_ids=[1],
+            output_response_ids=[4, 5, 6],
+            output_response_mask=[1, 1, 1],
+            metrics=metrics,
+            extra_fields={
+                "segment_ids": [0, 1, 1],
+                "reward_extra_info": {"segment_rewards": np.array([0.0, 2.0], dtype=np.float32)},
+            },
+            num_turns=2,
+            prompt_len=1,
+            response_len=4,
+        ),
+    ]
+
+    merged = AgentLoopWorker._postprocess(type("_DummyWorker", (), {"reward_loop_worker_handles": None})(), inputs)
+
+    assert merged.batch["segment_ids"].tolist() == [[0, 0, -1, -1], [0, 1, 1, -1]]
+    rewards = merged.non_tensor_batch["segment_rewards"]
+    assert rewards.shape == (2,) and rewards.dtype == object
+    assert rewards[0].tolist() == [1.0]
+    assert rewards[1].tolist() == [0.0, 2.0]
 
 
 @pytest.mark.asyncio
@@ -513,3 +599,94 @@ async def test_agent_loop_pad_token_ids_empty_with_non_zero_pad_id():
     # attention_mask should be all zeros
     expected_attention_mask = torch.zeros((1, 8), dtype=torch.long)
     torch.testing.assert_close(result["attention_mask"], expected_attention_mask)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["dataproto", "tq"])
+async def test_postprocess_preserves_evaluation_phase_after_training_budget_exhaustion(monkeypatch, transport):
+    from verl.experimental.reward_loop.reward_loop import RewardLoopWorker
+    from verl.experimental.reward_loop.reward_manager.polyseg import PolySegRewardManager
+    from verl.trainer.ppo.v1 import agent_loop_tq
+
+    config = OmegaConf.create({
+        "reward": {
+            "custom_reward_function": {"path": "unused"},
+            "reward_kwargs": {
+                "m": 1, "feedback": "terminal", "budget": 1,
+                "budget_scope": "global", "budget_fallback": "skip", "require_rollout_segments": True,
+            },
+        },
+        "algorithm": {"polyseg": {}},
+    })
+    calls = []
+
+    async def score(**kwargs):
+        calls.append(kwargs)
+        return {"score": 1.0, "acc": 1.0, "query_cost": 1.0}
+
+    manager = PolySegRewardManager(config, _FakeTokenizer(), score)
+    reward_worker = SimpleNamespace(config=config, reward_manager=manager)
+    phases = []
+
+    async def remote_score(data):
+        # Exercise the actual worker dispatch after AgentLoop builds its
+        # DataProto. Mock only Ray transport, not scoring or phase detection.
+        phases.append(bool(data.non_tensor_batch["validate"][0]))
+        return await RewardLoopWorker.compute_score(reward_worker, data)
+
+    class Worker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+        _compute_score = AgentLoopWorker._compute_score
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        _pad_token_ids = AgentLoopWorker._pad_token_ids
+        distillation_enabled = False
+        processor = None
+        mm_processor_kwargs = {}
+        tokenizer = _FakeTokenizer()
+        rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4})
+        reward_loop_worker_handles = [SimpleNamespace(compute_score=SimpleNamespace(remote=remote_score))]
+
+    partitions = []
+
+    async def put(**kwargs):
+        partitions.append(kwargs["partition_id"])
+        assert len(kwargs["keys"]) == 1
+
+    monkeypatch.setattr(agent_loop_tq.tq, "async_kv_batch_put", put)
+    # Ray's ActorClass accessor is bound; use the underlying class for a
+    # direct method call, as the existing TQ worker tests do.
+    worker_cls = (AgentLoopWorker if transport == "dataproto"
+                  else agent_loop_tq.AgentLoopWorkerTQ.__ray_metadata__.modified_class)
+    worker = Worker()
+
+    async def run(validate):
+        output = _make_agent_loop_output()
+        output.extra_fields["segment_ids"] = [0, 0]
+        await worker_cls._agent_loop_postprocess(
+            worker, output, validate, uid="uid", session_id=0, global_steps=1,
+            raw_prompt=[{"role": "user", "content": "hi"}],
+            data_source="dummy", reward_model={"ground_truth": "x"},
+        )
+        return output.extra_fields["reward_extra_info"]
+
+    training = await run(False)
+    assert training["segment_query_cost"] == 1.0
+    assert manager.global_budget.remaining == 0
+    exhausted = manager.global_budget.state_dict()
+    for _ in range(2):
+        evaluation = await run(True)
+        assert evaluation["acc"] == 1.0
+        assert evaluation["evaluation_query_cost"] == 1.0
+        assert evaluation["feedback_budget_scope"] == "evaluation"
+        assert manager.global_budget.state_dict() == exhausted
+    training_after = await run(False)
+    assert training_after["acc"] is None
+    assert training_after["segment_query_cost"] == 0
+    assert training_after["segment_feedback_fallback_count"] == 1
+    assert manager.global_budget.state_dict() == exhausted
+    assert phases == [False, True, True, False]
+    assert len(calls) == 3
+    if transport == "tq":
+        assert partitions == ["train", "val", "val", "train"]

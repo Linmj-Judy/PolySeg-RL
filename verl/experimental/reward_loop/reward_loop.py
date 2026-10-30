@@ -19,6 +19,7 @@ import os
 import aiohttp
 import numpy as np
 import ray
+import torch
 from omegaconf import DictConfig, open_dict
 from ray.actor import ActorHandle
 from tensordict import TensorDict
@@ -363,10 +364,86 @@ class RewardLoopManager:
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        # PolySeg reward managers return variable-length macro metadata.  Keep
+        # those fields as tensors in the training batch so the duration-aware
+        # advantage estimator can consume them; ordinary scalar metrics remain
+        # non-tensor reward extras for logging.
+        polyseg_tensor_keys = {
+            "segment_rewards",
+            "segment_ids",
+            "segment_durations",
+            "segment_mask",
+            "segment_feedback_mask",
+            "segment_features",
+            "segment_next_features",
+            "segment_transition_mask",
+        }
+        polyseg_values = {}
+        for key in polyseg_tensor_keys:
+            if key not in reward_extra_infos[0]:
+                continue
+            values = [info.get(key) for info in reward_extra_infos]
+            if any(value is None for value in values):
+                continue
+            if key == "segment_ids":
+                fill_value, dtype = -1, torch.long
+            elif key in {"segment_mask", "segment_feedback_mask", "segment_transition_mask"}:
+                # TransferQueue requires a stable dtype for every field.  A
+                # logical mask is transported as int64 and converted to bool
+                # only by the estimator or indexing code.
+                fill_value, dtype = 0, torch.long
+            else:
+                fill_value, dtype = 0.0, torch.float32
+            if key in {"segment_features", "segment_next_features"}:
+                max_len = max(len(value) for value in values)
+                feature_dim = max(np.asarray(value).shape[-1] for value in values)
+                padded = np.full(
+                    (len(values), max_len, feature_dim), fill_value, dtype=np.float32
+                )
+                for index, value in enumerate(values):
+                    array = np.asarray(value, dtype=np.float32)
+                    padded[index, : array.shape[0], : array.shape[1]] = array
+                polyseg_values[key] = torch.as_tensor(padded, dtype=dtype)
+                continue
+            # Token metadata must have the same width as the response tensor;
+            # valid responses are shorter than this width after EOS padding.
+            max_len = data.batch["responses"].shape[1] if key == "segment_ids" else max(len(value) for value in values)
+            padded = np.full((len(values), max_len), fill_value, dtype=np.float32 if dtype != torch.long else np.int64)
+            for index, value in enumerate(values):
+                array = np.asarray(value)
+                padded[index, : len(array)] = array
+            polyseg_values[key] = torch.as_tensor(padded, dtype=dtype)
+        # Keep the canonical reward tensor sparse for PolySeg: one macro
+        # feedback value is written at the final action token of each segment.
+        # This representation survives v1's TransferQueue even when optional
+        # metadata fields are not available, and pooling it reconstructs the
+        # macro rewards without duplicating a segment sum over every token.
+        if "segment_rewards" in polyseg_values and "segment_ids" in polyseg_values:
+            sparse_scores = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+            segment_rewards = polyseg_values["segment_rewards"]
+            segment_ids = polyseg_values["segment_ids"]
+            action_mask = data.batch.get("response_mask")
+            if action_mask is not None:
+                action_mask = action_mask.to(torch.bool)
+            for row in range(len(data)):
+                ids = segment_ids[row]
+                rewards = segment_rewards[row]
+                valid_ids = ids[ids >= 0]
+                count = min(int(valid_ids.max().item()) + 1 if valid_ids.numel() else 0, rewards.shape[0])
+                for segment_id in range(count):
+                    positions = torch.nonzero(ids == segment_id, as_tuple=False).flatten()
+                    if action_mask is not None:
+                        action_positions = positions[action_mask[row, positions]]
+                        if action_positions.numel():
+                            positions = action_positions
+                    if positions.numel():
+                        sparse_scores[row, int(positions[-1])] = rewards[segment_id]
+            batch["rm_scores"] = sparse_scores
+        reward_extra_keys = [key for key in reward_extra_infos[0].keys() if key not in polyseg_tensor_keys]
         non_tensor_batch = {}
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        batch.update(polyseg_values)
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

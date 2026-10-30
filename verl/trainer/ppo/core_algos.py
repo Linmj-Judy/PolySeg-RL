@@ -108,6 +108,11 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    # PolySeg uses macro segment feedback and a duration-aware GAE recursion.
+    # The implementation is imported lazily below to keep core_algos' import
+    # path lightweight for trainers that do not use PolySeg.
+    POLYSEG = "polyseg"
+    POLYSEG_GAE = "polyseg_gae"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -145,6 +150,18 @@ def get_adv_estimator_fn(name_or_enum):
         `(callable)`: The advantage estimator function.
     """
     name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+    if name in {AdvantageEstimator.POLYSEG.value, AdvantageEstimator.POLYSEG_GAE.value}:
+        # Importing here avoids a circular import: polyseg registers its
+        # functions through this module.
+        from verl.trainer.ppo import polyseg
+
+        # Test suites and plugin reloaders may replace the registry after the
+        # module has already been imported. Rebind the built-in adapters in
+        # that case so lazy lookup remains deterministic.
+        if name == AdvantageEstimator.POLYSEG.value and name not in ADV_ESTIMATOR_REGISTRY:
+            ADV_ESTIMATOR_REGISTRY[name] = polyseg.compute_polyseg_advantage_registered
+        if name == AdvantageEstimator.POLYSEG_GAE.value and name not in ADV_ESTIMATOR_REGISTRY:
+            ADV_ESTIMATOR_REGISTRY[name] = polyseg.compute_polyseg_gae_advantage_registered
     if name not in ADV_ESTIMATOR_REGISTRY:
         raise ValueError(f"Unknown advantage estimator simply: {name}")
     return ADV_ESTIMATOR_REGISTRY[name]

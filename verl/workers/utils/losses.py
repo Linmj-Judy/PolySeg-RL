@@ -25,10 +25,39 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def _scalar_metadata(data: TensorDict, key: str, default=None):
+    """Read scalar/non-tensor metadata without assuming one transport backend."""
+    value = tu.get_non_tensor_data(data=data, key=key, default=default)
+    if value is default and key in data:
+        value = data[key]
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def _count_valid_segments(
+    segment_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    segment_feedback_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Count observed rollout-owned macro actions, ignoring padding/missing labels."""
+    counts = []
+    for row, (ids, mask) in enumerate(zip(segment_ids, response_mask, strict=True)):
+        active = ids[mask & (ids >= 0)]
+        if segment_feedback_mask is not None and active.numel():
+            feedback = segment_feedback_mask[row].to(torch.bool)
+            active = active[feedback[active.clamp_min(0)]]
+        counts.append(torch.as_tensor(torch.unique(active).numel(), device=segment_ids.device))
+    return torch.stack(counts).sum() if counts else segment_ids.new_zeros(())
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-    dp_size = data["dp_size"]
-    batch_num_tokens = data["batch_num_tokens"]
+    dp_size = _scalar_metadata(data, "dp_size", 1)
+    batch_num_tokens = _scalar_metadata(data, "batch_num_tokens", None)
 
     log_prob = model_output["log_probs"]
 
@@ -66,19 +95,27 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         if key in model_output
     }
 
+    # Read transport metadata before selecting/padding the tensor fields below.
+    # ``TensorDict.select`` intentionally drops non-selected metadata; using
+    # ``data["dp_size"]`` after that conversion therefore fails for the FSDP
+    # actor path (where dp_size is attached as non-tensor metadata).
+    dp_size = _scalar_metadata(data, "dp_size", 1)
+    batch_num_tokens = _scalar_metadata(data, "batch_num_tokens", None)
+    global_batch_size = _scalar_metadata(data, "global_batch_size", None)
+
     # global batch info for loss aggregation
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["dp_size"] = dp_size
+    config.global_batch_info["batch_num_tokens"] = batch_num_tokens
+    config.global_batch_info["global_batch_size"] = global_batch_size
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
     # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
     # to reflect the mean loss over the global batch
     if (
-        data["dp_size"] > 1
-        or data["batch_num_tokens"] is not None
-        or data["global_batch_size"] is not None
+        dp_size > 1
+        or batch_num_tokens is not None
+        or global_batch_size is not None
         or config.loss_scale_factor is not None
     ):
         metric_aggregation = AggregationType.SUM
@@ -88,11 +125,33 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
     fields = ["response_mask", "old_log_probs", "advantages"]
+    use_polyseg_loss = loss_mode == "polyseg"
+    if use_polyseg_loss and "segment_ids" in data:
+        fields.append("segment_ids")
+    if use_polyseg_loss and "segment_feedback_mask" in data:
+        fields.append("segment_feedback_mask")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    # Capture rollout boundary ids before padding.  They are a required actor
+    # input for PolySeg; ``compute_segment_policy_loss`` has a historical
+    # smoke-test fallback, but production PPO must never use it.
+    segment_ids = None
+    global_macro_batch_size = None
+    if use_polyseg_loss:
+        if "segment_ids" not in data:
+            raise ValueError(
+                "PolySeg actor PPO requires rollout-owned segment_ids; "
+                "event boundaries must not be inferred from response masks"
+            )
+        segment_ids = data["segment_ids"]
+        global_macro_batch_size = _scalar_metadata(data, "global_macro_batch_size", None)
+        if global_macro_batch_size is None:
+            global_macro_batch_size = _scalar_metadata(data, "batch_num_segments", None)
+
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -103,20 +162,50 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_agg_mode = config.loss_agg_mode
 
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    if use_polyseg_loss:
+        from verl.trainer.ppo.polyseg import compute_segment_policy_loss
 
-    policy_loss_fn = get_policy_loss_fn(loss_mode)
-    policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-        **policy_loss_kwargs,
-    )
+        pg_loss, pg_metrics = compute_segment_policy_loss(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            token_advantages=advantages,
+            response_mask=response_mask,
+            segment_ids_tensor=data["segment_ids"],
+            segment_feedback_mask=data.get("segment_feedback_mask"),
+            num_segments=int(config.get("polyseg_num_segments", 4)),
+            clip_ratio=config.clip_ratio,
+            rollout_is_weights=rollout_is_weights,
+        )
+        # ``compute_segment_policy_loss`` returns a local mean over valid macro
+        # actions.  Rescale it to the global macro denominator so uneven
+        # segment counts across micro-batches/ranks cannot change the gradient.
+        local_macro_count = _count_valid_segments(
+            data["segment_ids"], response_mask, data.get("segment_feedback_mask")
+        ).to(pg_loss.dtype)
+        if global_macro_batch_size is None:
+            if dp_size > 1:
+                raise ValueError(
+                    "global_macro_batch_size is required for PolySeg actor PPO when dp_size > 1"
+                )
+            global_macro_batch_size = local_macro_count
+        global_macro_batch_size = torch.as_tensor(
+            global_macro_batch_size, dtype=pg_loss.dtype, device=pg_loss.device
+        ).clamp_min(1)
+        pg_loss = pg_loss * local_macro_count / global_macro_batch_size * dp_size
+        pg_metrics = {key.replace("segment/", "actor/"): value.detach().item() for key, value in pg_metrics.items()}
+    else:
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+        policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
+        pg_loss, pg_metrics = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+            **policy_loss_kwargs,
+        )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -172,9 +261,9 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
     # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
     # invariant to how the mini-batch is split into micro-batches (as the actor's ppo_loss does).
-    dp_size = data["dp_size"]
-    batch_num_tokens = data["batch_num_tokens"]
-    global_batch_size = data["global_batch_size"]
+    dp_size = _scalar_metadata(data, "dp_size", 1)
+    batch_num_tokens = _scalar_metadata(data, "batch_num_tokens", None)
+    global_batch_size = _scalar_metadata(data, "global_batch_size", None)
 
     # When the loss is normalized over the global batch, each micro-batch contributes a partial sum,
     # so the loss metric must be aggregated with SUM to reflect the global-batch mean.

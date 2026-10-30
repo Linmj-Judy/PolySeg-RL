@@ -65,6 +65,11 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.polyseg_journal import (
+    configured_feedback_ledger_path,
+    snapshot_feedback_ledger,
+    verify_feedback_ledger_snapshot,
+)
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
@@ -245,6 +250,76 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator in (AdvantageEstimator.POLYSEG, AdvantageEstimator.POLYSEG_GAE, "polyseg", "polyseg_gae"):
+        # Segment rewards, values and masks are carried as optional batch
+        # fields.  The registered estimator maps one macro advantage to every
+        # action token in its segment; it does not duplicate a macro reward in
+        # the token reward tensor.
+        from verl.trainer.ppo import polyseg  # noqa: F401  # register lazily
+
+        advantages, returns = core_algos.get_adv_estimator_fn(adv_estimator)(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            values=data.batch.get("values"),
+            config=config,
+            batch=data.batch,
+            non_tensor_batch=data.non_tensor_batch,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        # PolySeg keeps critic diagnostics in the non-tensor side channel so
+        # padding-free workers never interpret them as token sequences.
+        if adv_estimator in (AdvantageEstimator.POLYSEG, AdvantageEstimator.POLYSEG_GAE, "polyseg", "polyseg_gae"):
+            for source_key, metric_key in (
+                ("polyseg_critic_mse", "polyseg/critic_mse"),
+                ("polyseg_bellman_residual_mse", "polyseg/bellman_residual_mse"),
+                ("polyseg_confidence_bonus", "polyseg/confidence_bonus"),
+                ("polyseg_confidence_pre_update", "polyseg/confidence_pre_update"),
+                ("polyseg_feature_condition", "polyseg/feature_condition"),
+                ("polyseg_feature_min_eigenvalue", "polyseg/feature_min_eigenvalue"),
+                ("polyseg_feature_effective_samples", "polyseg/effective_samples"),
+                ("polyseg_feature_batch_samples", "polyseg/batch_samples"),
+                ("polyseg_estimator_sample_count", "polyseg/estimator_samples"),
+                ("polyseg_transition_effective_samples", "polyseg/transition_samples"),
+                ("polyseg_feature_dimension", "polyseg/feature_dimension"),
+                ("polyseg_transition_confidence_bonus", "polyseg/transition_confidence_bonus"),
+                ("polyseg_transition_feature_condition", "polyseg/transition_feature_condition"),
+                ("polyseg_transition_feature_min_eigenvalue", "polyseg/transition_min_eigenvalue"),
+                ("polyseg_kappa_segment", "polyseg/kappa_segment"),
+                ("polyseg_kappa_segment_upper", "polyseg/kappa_segment_upper"),
+                ("polyseg_kappa_segment_selected_upper", "polyseg/kappa_segment_selected_upper"),
+                ("polyseg_kappa_trajectory", "polyseg/kappa_trajectory"),
+                ("polyseg_kappa_trajectory_upper", "polyseg/kappa_trajectory_upper"),
+                ("polyseg_effective_samples", "polyseg/dependence_effective_samples"),
+                ("polyseg_weighted_effective_samples", "polyseg/weighted_effective_samples"),
+                ("polyseg_iid_cluster_radius_ratio", "polyseg/iid_cluster_radius_ratio"),
+                ("polyseg_iid_cluster_radius_ratio_upper", "polyseg/iid_cluster_radius_ratio_upper"),
+                ("polyseg_chi_hat", "polyseg/chi_hat"),
+                ("polyseg_hac_lag", "polyseg/hac_lag"),
+                ("polyseg_dependence_diagnostic_oof", "polyseg/dependence_diagnostic_oof"),
+                ("polyseg_dependence_residual_rms", "polyseg/dependence_residual_rms"),
+                ("polyseg_dependence_radius_multiplier", "polyseg/dependence_radius_multiplier"),
+                ("polyseg_dependence_logistic_score", "polyseg/dependence_logistic_score"),
+            ):
+                if source_key in data.non_tensor_batch:
+                    data.meta_info.setdefault("polyseg_metrics", {})[metric_key] = float(
+                        np.asarray(data.non_tensor_batch[source_key], dtype=np.float32).mean()
+                    )
+            for source_key, metric_key in (
+                ("polyseg_adaptive_q", "polyseg/adaptive_q"),
+                ("polyseg_adaptive_m", "polyseg/adaptive_m"),
+                ("polyseg_adaptive_planned_cost", "polyseg/adaptive_planned_cost"),
+                ("polyseg_adaptive_compute_cost", "polyseg/adaptive_compute_cost"),
+                ("polyseg_adaptive_actual_cost", "polyseg/adaptive_actual_cost"),
+                ("polyseg_adaptive_remaining_budget", "polyseg/adaptive_remaining_budget"),
+                ("polyseg_adaptive_fallback_count", "polyseg/adaptive_fallback_count"),
+                ("segment_feedback_fallback_count", "polyseg/feedback_fallback_count"),
+            ):
+                if source_key in data.non_tensor_batch:
+                    values = np.asarray(data.non_tensor_batch[source_key], dtype=np.float32)
+                    values = values[np.isfinite(values)]
+                    if values.size:
+                        data.meta_info.setdefault("polyseg_metrics", {})[metric_key] = float(values.mean())
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -257,6 +332,9 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if adv_estimator in (AdvantageEstimator.POLYSEG, AdvantageEstimator.POLYSEG_GAE, "polyseg", "polyseg_gae"):
+            adv_kwargs["batch"] = data.batch
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
         # GDPO: pass raw data for per-dimension reward extraction
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
@@ -963,6 +1041,12 @@ class RayPPOTrainer:
             teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
+        # Keep the legacy attribute in sync with the driver-side manager.  The
+        # PolySeg adaptive selector is owned by this manager, and the legacy
+        # PPO loop still reads ``agent_loop_manager`` after each advantage
+        # computation.  Without this alias, adaptive runs fail only when the
+        # first batch reaches the dependence-diagnostic update.
+        self.agent_loop_manager = self.async_rollout_manager
 
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         # Support custom CheckpointEngineManager via config
@@ -1033,6 +1117,33 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # ``algorithm`` may be omitted by legacy/non-PolySeg checkpoint
+        # configurations; checkpoint I/O must remain valid in that case.
+        polyseg_config = self.config.get("algorithm", {}).get("polyseg", {})
+        if polyseg_config.get("accumulate_estimator", False):
+            from verl.trainer.ppo.polyseg import polyseg_estimator_state_dict
+
+            torch.save(
+                polyseg_estimator_state_dict(),
+                os.path.join(local_global_step_folder, "polyseg_estimator.pt"),
+            )
+
+        controller = getattr(getattr(self, "agent_loop_manager", None), "polyseg_controller", None)
+        if controller is None:
+            controller = getattr(getattr(self, "async_rollout_manager", None), "polyseg_controller", None)
+        if controller is not None:
+            torch.save(controller.state_dict(), os.path.join(local_global_step_folder, "polyseg_controller.pt"))
+            print("Saved PolySeg adaptive selector state")
+
+        ledger_path = configured_feedback_ledger_path(self.config)
+        if ledger_path is not None:
+            ledger_snapshot_path = os.path.join(local_global_step_folder, "polyseg_feedback_ledger.json")
+            try:
+                snapshot_feedback_ledger(ledger_path, ledger_snapshot_path)
+                print("Saved PolySeg feedback-ledger snapshot")
+            except FileNotFoundError:
+                print("Warning: configured PolySeg feedback ledger is missing; checkpoint is not ledger-resumable")
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1050,6 +1161,12 @@ class RayPPOTrainer:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        self._pending_polyseg_controller_state = None
+        polyseg_config = self.config.get("algorithm", {}).get("polyseg", {})
+        if polyseg_config.get("accumulate_estimator", False):
+            from verl.trainer.ppo.polyseg import reset_polyseg_estimator_state
+
+            reset_polyseg_estimator_state()
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -1084,6 +1201,39 @@ class RayPPOTrainer:
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        controller_state_path = os.path.join(global_step_folder, "polyseg_controller.pt")
+        if os.path.exists(controller_state_path):
+            state = torch.load(controller_state_path, weights_only=False)
+            manager = getattr(self, "agent_loop_manager", None)
+            if manager is None:
+                manager = getattr(self, "async_rollout_manager", None)
+            controller = getattr(manager, "polyseg_controller", None)
+            if controller is None:
+                raise RuntimeError("checkpoint contains PolySeg controller state but adaptive manager is disabled")
+            from verl.trainer.ppo.polyseg import BudgetedPolySegController
+
+            manager.polyseg_controller = BudgetedPolySegController.from_state_dict(state)
+            print("Restored PolySeg adaptive selector state")
+
+        ledger_path = configured_feedback_ledger_path(self.config)
+        ledger_snapshot_path = os.path.join(global_step_folder, "polyseg_feedback_ledger.json")
+        if ledger_path is not None:
+            if not os.path.exists(ledger_snapshot_path):
+                raise RuntimeError(
+                    "checkpoint is missing polyseg_feedback_ledger.json while a shared feedback ledger is configured"
+                )
+            verify_feedback_ledger_snapshot(ledger_path, ledger_snapshot_path)
+            print("Verified PolySeg feedback-ledger snapshot before resume")
+
+        if polyseg_config.get("accumulate_estimator", False):
+            polyseg_state_path = os.path.join(global_step_folder, "polyseg_estimator.pt")
+            if os.path.exists(polyseg_state_path):
+                from verl.trainer.ppo.polyseg import load_polyseg_estimator_state_dict
+
+                load_polyseg_estimator_state_dict(torch.load(polyseg_state_path, weights_only=False), clear=True)
+            else:
+                print(f"Warning: No PolySeg estimator state found at {polyseg_state_path}; starting from scratch")
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -1351,6 +1501,19 @@ class RayPPOTrainer:
             )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        global_macro_batch_size = None
+        if self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "polyseg":
+            if "segment_ids" not in batch.batch:
+                raise ValueError(
+                    "PolySeg actor PPO requires rollout-owned segment_ids in the legacy batch"
+                )
+            ids = batch.batch["segment_ids"]
+            mask = batch.batch["response_mask"].to(torch.bool)
+            if ids.is_nested:
+                ids = ids.to_padded_tensor(-1)
+            global_macro_batch_size = 0
+            for row_ids, row_mask in zip(ids, mask, strict=True):
+                global_macro_batch_size += int(torch.unique(row_ids[row_mask & (row_ids >= 0)]).numel())
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1365,6 +1528,7 @@ class RayPPOTrainer:
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
+            **({"global_macro_batch_size": global_macro_batch_size} if global_macro_batch_size is not None else {}),
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
@@ -1551,6 +1715,37 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # Record realized rollout token costs.  Response length is
+                    # a cap, while response_mask separates model actions from
+                    # tool observations.  These per-batch totals are consumed
+                    # by run_matrix.parse_log and summed across all updates.
+                    response_width = batch.batch["responses"].shape[-1]
+                    attention = batch.batch["attention_mask"]
+                    prompt_tokens = attention[:, :-response_width].sum(dim=-1)
+                    response_tokens = attention[:, -response_width:].sum(dim=-1)
+                    action_tokens = batch.batch["response_mask"].to(torch.float32).sum(dim=-1)
+                    metrics.update(
+                        {
+                            "resource/prompt_tokens_batch_total": int(prompt_tokens.sum().item()),
+                            "resource/response_tokens_batch_total": int(response_tokens.sum().item()),
+                            "resource/action_tokens_batch_total": int(action_tokens.sum().item()),
+                            "resource/tool_observation_tokens_batch_total": int(
+                                (response_tokens - action_tokens).sum().item()
+                            ),
+                            "resource/total_tokens_batch_total": int((prompt_tokens + response_tokens).sum().item()),
+                        }
+                    )
+                    for field, metric_key in (
+                        ("tool_call_count", "resource/tool_calls_batch_total"),
+                        ("tool_call_success_count", "resource/tool_successes_batch_total"),
+                        ("tool_call_failure_count", "resource/tool_failures_batch_total"),
+                    ):
+                        values = batch.non_tensor_batch.get(field)
+                        if values is not None:
+                            try:
+                                metrics[metric_key] = int(np.asarray(values, dtype=np.float64).sum())
+                            except (TypeError, ValueError):
+                                pass
                     # get images_seqlens
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -1673,6 +1868,29 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        controller = getattr(self.agent_loop_manager, "polyseg_controller", None)
+                        if controller is not None and self.config.algorithm.adv_estimator in ("polyseg", "polyseg_gae"):
+                            try:
+                                selected_m = np.asarray(batch.non_tensor_batch.get("polyseg_adaptive_m"), dtype=np.float64)
+                                selected_q = np.asarray(batch.non_tensor_batch.get("polyseg_adaptive_q"), dtype=np.float64)
+                                seg_upper = np.asarray(batch.non_tensor_batch.get("polyseg_kappa_segment_selected_upper"), dtype=np.float64)
+                                if seg_upper.size == 0:
+                                    seg_upper = np.asarray(batch.non_tensor_batch.get("polyseg_kappa_segment_upper"), dtype=np.float64)
+                                tr_upper = np.asarray(batch.non_tensor_batch.get("polyseg_kappa_trajectory_upper"), dtype=np.float64)
+                                selected_m = selected_m[np.isfinite(selected_m)]
+                                selected_q = selected_q[np.isfinite(selected_q)]
+                                seg_upper = seg_upper[np.isfinite(seg_upper)]
+                                tr_upper = tr_upper[np.isfinite(tr_upper)]
+                                if selected_m.size and seg_upper.size and tr_upper.size:
+                                    controller.update_dependence_diagnostics(
+                                        m=int(round(float(selected_m.mean()))),
+                                        kappa_segment_upper=float(seg_upper.mean()),
+                                        kappa_trajectory_upper=float(tr_upper.mean()),
+                                        q=None if not selected_q.size else int(round(float(selected_q.mean()))),
+                                    )
+                            except (TypeError, ValueError, AttributeError):
+                                pass
+                        metrics.update(batch.meta_info.pop("polyseg_metrics", {}))
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):

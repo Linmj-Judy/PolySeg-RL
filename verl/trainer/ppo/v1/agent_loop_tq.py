@@ -160,7 +160,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
-        await self._compute_score(outputs, kwargs=kwargs)
+        await self._compute_score(outputs, kwargs={**kwargs, "validate": bool(validate)})
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -251,6 +251,9 @@ class AgentLoopManagerTQ(AgentLoopManager):
         Args:
             prompts (TensorDict): Input batch from train or validation dataset.
         """
+        from verl.utils.polyseg_feedback import is_validation_batch
+
+        self._prepare_polyseg_adaptive(prompts, validate=is_validation_batch(prompts))
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         ray.get(
             [

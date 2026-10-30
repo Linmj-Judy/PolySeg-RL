@@ -17,7 +17,68 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+    "PolySegAlgorithmConfig",
+]
+
+
+@dataclass
+class PolySegAlgorithmConfig(BaseConfig):
+    """Configuration exposed at ``algorithm.polyseg``."""
+
+    q: int = 2
+    m: int = 4
+    feature_dim: int = 4
+    # Fixed rollout horizon used to normalize macro-state features.  Keeping
+    # this independent of per-batch padding makes the feature-map contract
+    # stable across ragged responses and validation batches.
+    feature_horizon: int | None = None
+    use_polynomial_critic: bool = False
+    critic_type: str = "polynomial"
+    mlp_hidden_dim: int = 32
+    mlp_learning_rate: float = 0.05
+    mlp_steps: int = 100
+    # Target used by the frozen polynomial critic.  ``return`` follows the
+    # macro Bellman/Monte-Carlo target from paper_methods.md; ``value`` is a
+    # compatibility mode for older experiments that smooths transformer
+    # value predictions instead.
+    polynomial_target: str = "return"
+    basis: str = "total"
+    normalized_basis: bool = False
+    feedback: str = "sum"
+    ridge_lambda: float = 1.0
+    logistic_l2: float = 1.0
+    normalize_advantages: bool = True
+    segment_cost: float = 1.0
+    budget: int | None = None
+    # Declared critic-side compute cost per polynomial feature and segment.
+    # Kept separate from verifier/suffix feedback cost for resource-matched
+    # selector experiments.
+    critic_compute_cost: float = 0.0
+    compute_budget: float | None = None
+    smoothness_s: float = 2.0
+    stat_exponent_u: float = 1.0
+    approx_exponent_v: float = 1.0
+    segment_exponent_gamma: float = 1.0
+    dependence_chi: float = 1.0
+    stat_constant: float = 1.0
+    approx_constant: float = 1.0
+    segment_constant: float = 1.0
+    cost_penalty: float = 0.0
+    use_confidence_bonus: bool = False
+    reward_confidence_beta: float = 1.0
+    transition_confidence_beta: float = 1.0
+    use_transition_estimator: bool = False
+    transition_ridge_lambda: float = 1.0
+    transition_backup_iterations: int = 1
+    # Macro-critic observation weighting for variable-length agentic segments.
+    critic_weighting: str = "duration"
+    accumulate_estimator: bool = False
+    estimator_state_id: str = ""
 
 
 @dataclass
@@ -748,3 +809,4 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    polyseg: PolySegAlgorithmConfig = field(default_factory=PolySegAlgorithmConfig)

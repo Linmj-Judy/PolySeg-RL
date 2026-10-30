@@ -34,6 +34,7 @@ from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionParsedSch
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
+from verl.trainer.ppo.polyseg import build_segment_features
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -84,6 +85,20 @@ class AgentData:
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
+        # Rollout-owned PolySeg metadata.  A segment contains one assistant
+        # action and, when present, its tool call/observation.  Observation
+        # tokens remain response_mask=0 but retain the segment id.
+        self.segment_ids: list[int] = []
+        self.current_segment_id = 0
+        self.next_segment_pending = False
+        # Per-segment environment context.  These fields stay aligned with
+        # ``segment_ids`` at the macro level and are consumed by a verifier or
+        # suffix-feedback scorer; they are deliberately kept separate from
+        # token text because tool observations are not policy actions.
+        self.segment_tool_observations: dict[int, list[str]] = {}
+        self.segment_tool_calls: dict[int, list[dict[str, Any]]] = {}
+        self.segment_action_texts: dict[int, str] = {}
+        self.segment_durations: dict[int, float] = {}
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
         self.user_turns = 0
@@ -91,6 +106,11 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+        # Explicit per-trajectory tool accounting is exported with the
+        # rollout so full agentic runs can report valid calls and failures,
+        # rather than inferring them from token counts.
+        self.tool_call_successes = 0
+        self.tool_call_failures = 0
 
         self.routed_experts = None
 
@@ -209,7 +229,125 @@ class ToolAgentLoop(AgentLoopBase):
             ),
             extra_fields=agent_data.extra_fields,
         )
+        response_length = len(output.response_ids)
+        segment_ids = agent_data.segment_ids[:response_length]
+        segment_count = max(segment_ids) + 1 if segment_ids else 0
+        # Adaptive m is an upper bound for event-native agent segments.  If a
+        # trajectory has more event segments than selected m, merge adjacent
+        # complete events rather than splitting a tool call/observation pair.
+        configured_m = kwargs.get("polyseg_adaptive_m", 0)
+        configured_m = int(configured_m.item() if hasattr(configured_m, "item") else configured_m or 0)
+        if configured_m > 0 and segment_count > configured_m:
+            old_count = segment_count
+            remap = {
+                old_id: min(configured_m - 1, (old_id * configured_m) // old_count)
+                for old_id in range(old_count)
+            }
+            segment_ids = [remap.get(value, value) for value in segment_ids]
+            merged_observations: dict[int, list[str]] = {}
+            merged_calls: dict[int, list[dict[str, Any]]] = {}
+            merged_actions: dict[int, list[str]] = {}
+            merged_durations: dict[int, float] = {}
+            for old_id, new_id in remap.items():
+                merged_observations.setdefault(new_id, []).extend(agent_data.segment_tool_observations.get(old_id, []))
+                merged_calls.setdefault(new_id, []).extend(agent_data.segment_tool_calls.get(old_id, []))
+                merged_actions.setdefault(new_id, []).append(agent_data.segment_action_texts.get(old_id, ""))
+                merged_durations[new_id] = merged_durations.get(new_id, 0.0) + float(
+                    agent_data.segment_durations.get(old_id, 1.0)
+                )
+            agent_data.segment_tool_observations = merged_observations
+            agent_data.segment_tool_calls = merged_calls
+            agent_data.segment_action_texts = {
+                key: "\\n".join(value) for key, value in merged_actions.items()
+            }
+            agent_data.segment_durations = merged_durations
+            segment_count = configured_m
+        segment_durations = [
+            float(agent_data.segment_durations.get(segment_id, 1.0))
+            for segment_id in range(segment_count)
+        ]
+        segment_action_lengths = [
+            sum(
+                1
+                for token_segment_id, is_action in zip(segment_ids, output.response_mask)
+                if is_action and token_segment_id == segment_id
+            )
+            for segment_id in range(segment_count)
+        ]
+        segment_tool_calls = [
+            list(agent_data.segment_tool_calls.get(segment_id, []))
+            for segment_id in range(segment_count)
+        ]
+        segment_boundaries = [
+            (segment_ids.index(segment_id), len(segment_ids) - segment_ids[::-1].index(segment_id))
+            for segment_id in range(segment_count)
+        ] if segment_ids else []
+        # Tool-agent rollouts own the event boundaries and therefore can
+        # expose the observed successor boundary feature directly.  The final
+        # event is terminal and intentionally has no transition label.
+        segment_features = build_segment_features(
+            segment_boundaries,
+            segment_durations,
+            response_length=max(self.response_length, 1),
+            action_lengths=segment_action_lengths,
+            tool_call_counts=[len(calls) for calls in segment_tool_calls],
+            feature_dim=max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4))),
+        )
+        segment_next_features = torch.zeros_like(segment_features)
+        segment_transition_mask = [False] * segment_count
+        if segment_count > 1:
+            segment_next_features[:-1] = segment_features[1:]
+            segment_transition_mask[:-1] = [True] * (segment_count - 1)
+        output.extra_fields.update(
+            {
+                "segment_ids": segment_ids,
+                "polyseg_adaptive_actual_m": segment_count,
+                "polyseg_m_semantics": "event_boundary_cap" if configured_m > 0 else "event_boundary_count",
+                # One assistant/tool interaction is one macro transition by
+                # default.  Tools may return a measured duration in their
+                # result metadata; that value is preserved for duration-aware
+                # Bellman/GAE instead of deriving duration from token count.
+                "segment_durations": segment_durations,
+                "segment_action_lengths": segment_action_lengths,
+                "segment_tool_observations": [
+                    list(agent_data.segment_tool_observations.get(segment_id, []))
+                    for segment_id in range(segment_count)
+                ],
+                "segment_tool_calls": segment_tool_calls,
+                "segment_action_texts": [
+                    agent_data.segment_action_texts.get(segment_id, "")
+                    for segment_id in range(segment_count)
+                ],
+                "segment_state_ids": [
+                    f"{request_id}:s{segment_id}" for segment_id in range(segment_count)
+                ],
+                "trajectory_id": request_id,
+                "episode_id": request_id,
+                "segment_boundaries": segment_boundaries,
+                "segment_next_features": segment_next_features.tolist(),
+                "segment_transition_mask": segment_transition_mask,
+            }
+        )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.update(
+            {
+                "tool_call_count": int(sum(len(calls) for calls in agent_data.segment_tool_calls.values())),
+                "tool_call_success_count": int(agent_data.tool_call_successes),
+                "tool_call_failure_count": int(agent_data.tool_call_failures),
+            }
+        )
+        for key in (
+            "polyseg_adaptive_q",
+            "polyseg_adaptive_m",
+            "polyseg_adaptive_planned_cost",
+            "polyseg_adaptive_compute_cost",
+            "polyseg_adaptive_remaining_budget",
+            "polyseg_adaptive_fallback",
+            "polyseg_adaptive_fallback_reason",
+        ):
+            if key in kwargs:
+                value = kwargs[key]
+                output.extra_fields[key] = value.item() if hasattr(value, "item") else value
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -235,6 +373,9 @@ class ToolAgentLoop(AgentLoopBase):
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
+        if agent_data.next_segment_pending:
+            agent_data.current_segment_id += 1
+            agent_data.next_segment_pending = False
         # Inject tool parser stop tokens so generation halts after each tool call
         if self.tool_parser.stop_token_ids:
             stop_token_ids = list(set((sampling_params.get("stop_token_ids") or []) + self.tool_parser.stop_token_ids))
@@ -280,6 +421,9 @@ class ToolAgentLoop(AgentLoopBase):
         )
         agent_data.prompt_ids = merge_result.token_ids
         agent_data.response_mask = response_mask
+        agent_data.segment_ids = AgentLoopBase.align_segment_ids(
+            merge_result, getattr(agent_data, "segment_ids", []), getattr(agent_data, "current_segment_id", 0)
+        )
         if response_logprobs is not None:
             agent_data.response_logprobs = response_logprobs
 
@@ -300,6 +444,27 @@ class ToolAgentLoop(AgentLoopBase):
         assistant_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(
             agent_data.response_ids, tools
         )
+        # Preserve the exact assistant action text at the segment level for
+        # replay/failure analysis.  Tool observations are recorded separately
+        # and remain response_mask=0.
+        agent_data.segment_action_texts[agent_data.current_segment_id] = self.tokenizer.decode(
+            agent_data.response_ids, skip_special_tokens=False
+        )
+        if agent_data.tool_calls:
+            segment_tool_calls = getattr(agent_data, "segment_tool_calls", None)
+            if segment_tool_calls is None:
+                segment_tool_calls = {}
+                agent_data.segment_tool_calls = segment_tool_calls
+            segment_tool_calls.setdefault(agent_data.current_segment_id, []).extend(
+                [
+                    {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                        "tool_call_id": call.tool_call_id,
+                    }
+                    for call in agent_data.tool_calls[: self.max_parallel_calls]
+                ]
+            )
         agent_data.messages.append(self._build_assistant_message(assistant_content, agent_data))
 
         if agent_data.tool_calls:
@@ -322,7 +487,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_index, (tool_response, tool_reward, _) in enumerate(responses):
+        for tool_index, (tool_response, tool_reward, tool_metadata) in enumerate(responses):
             tool_call = agent_data.tool_calls[tool_index]
             # Create message from tool response
             if tool_response.image or tool_response.video:
@@ -350,6 +515,28 @@ class ToolAgentLoop(AgentLoopBase):
                 message["tool_call_id"] = tool_call.tool_call_id
 
             add_messages.append(message)
+
+            segment_id = int(getattr(agent_data, "current_segment_id", 0))
+            segment_tool_observations = getattr(agent_data, "segment_tool_observations", None)
+            if segment_tool_observations is None:
+                segment_tool_observations = {}
+                agent_data.segment_tool_observations = segment_tool_observations
+            segment_tool_observations.setdefault(segment_id, []).append(tool_response.text or "")
+            if isinstance(tool_metadata, dict):
+                duration = tool_metadata.get("duration", tool_metadata.get("segment_duration"))
+                if duration is not None:
+                    duration = float(duration)
+                    if duration <= 0:
+                        raise ValueError("tool duration must be positive")
+                    # Parallel tool calls form one environment transition;
+                    # retain the slowest measured call as its duration.
+                    segment_durations = getattr(agent_data, "segment_durations", None)
+                    if segment_durations is None:
+                        segment_durations = {}
+                        agent_data.segment_durations = segment_durations
+                    segment_durations[segment_id] = max(
+                        segment_durations.get(segment_id, 1.0), duration
+                    )
 
             # Handle image data
             if tool_response.image:
@@ -391,10 +578,16 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs if agent_data.response_logprobs else None,
             tools=schemas,
         )
+        agent_data.segment_ids = AgentLoopBase.align_segment_ids(
+            merge_result, getattr(agent_data, "segment_ids", []), getattr(agent_data, "current_segment_id", 0)
+        )
         if len(response_mask) >= self.response_length:
             return AgentState.TERMINATED
         agent_data.prompt_ids = merge_result.token_ids
         agent_data.response_mask = response_mask
+        # The next assistant action starts the next macro segment; the tool
+        # observation just appended above stays in the current segment.
+        agent_data.next_segment_pending = True
         if agent_data.response_logprobs:
             agent_data.response_logprobs = response_logprobs or []
 
@@ -458,6 +651,9 @@ class ToolAgentLoop(AgentLoopBase):
             available = list(active_tools.keys())
             msg = f"Unknown function '{tool_name}'. Available tools: {available}"
             logger.warning(msg)
+            # Keep the error path compatible with lightweight AgentData-like
+            # objects used by callers/tests that predate the replay counters.
+            agent_data.tool_call_failures = getattr(agent_data, "tool_call_failures", 0) + 1
             return ToolResponse(text=msg), 0.0, {}
 
         # Validate tool arguments
@@ -466,6 +662,7 @@ class ToolAgentLoop(AgentLoopBase):
         except (json.JSONDecodeError, TypeError) as e:
             msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
             logger.warning(msg)
+            agent_data.tool_call_failures = getattr(agent_data, "tool_call_failures", 0) + 1
             return ToolResponse(text=msg), 0.0, {}
 
         # Execute tool
@@ -489,6 +686,7 @@ class ToolAgentLoop(AgentLoopBase):
                 )
         except Exception as e:
             logger.warning(f"Error executing tool '{tool_name}': {e}")
+            agent_data.tool_call_failures = getattr(agent_data, "tool_call_failures", 0) + 1
             return ToolResponse(text=f"Error executing tool '{tool_name}': {e}"), 0.0, {}
         finally:
             # Only BaseTool instances need release (function tools never set instance_id).
@@ -515,4 +713,5 @@ class ToolAgentLoop(AgentLoopBase):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
+        agent_data.tool_call_successes = getattr(agent_data, "tool_call_successes", 0) + 1
         return ToolResponse(**tool_response_kwargs), tool_reward, res

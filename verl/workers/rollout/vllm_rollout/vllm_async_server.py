@@ -154,7 +154,7 @@ class vLLMHttpServer:
         # the same /tmp/rl-colocate-zmq-replica-0-rank-0.sock and one fails
         # with EADDRINUSE; a stale socket from a crashed run trips the same
         # error on restart.
-        os.environ["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
+        os.environ.setdefault("VERL_RAY_JOB_ID", ray.get_runtime_context().get_job_id())
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -1541,6 +1541,7 @@ class vLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                "VERL_RAY_JOB_ID": os.environ.get("VERL_RAY_JOB_ID", ray.get_runtime_context().get_job_id()),
             }
 
             server = self.server_class.options(

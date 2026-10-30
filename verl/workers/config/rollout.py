@@ -182,6 +182,50 @@ class RolloutConfig(BaseConfig):
     prompt_length: int = 512
     response_length: int = 512
 
+    # Optional fixed-token segmentation for single-turn trajectories. A value
+    # of 0 keeps the default one-segment behavior; tool-agent boundaries are
+    # always supplied by the rollout loop itself.
+    polyseg_fixed_m: int = 0
+
+    # Enable the theory's online finite (q,m) controller at rollout-batch
+    # boundaries. The selected pair is carried with each trajectory and used
+    # by the reward/advantage path; fixed experiments leave this disabled.
+    polyseg_adaptive: bool = False
+
+    # Candidate polynomial orders for the adaptive controller.
+    polyseg_q_candidates: list[int] = field(default_factory=lambda: [0, 1, 2, 4])
+
+    # Candidate segment counts for the adaptive controller.
+    polyseg_m_candidates: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+
+    # Optional total feedback budget consumed across rollout batches.
+    polyseg_total_budget: Optional[float] = None
+
+    # Query cost assumed by the finite controller.
+    polyseg_segment_cost: float = 1.0
+
+    # Optional declared critic-side compute cost per polynomial feature and
+    # observed segment. This is tracked separately from verifier feedback.
+    polyseg_critic_compute_cost: float = 0.0
+
+    # Optional cumulative critic-compute budget for adaptive selection.
+    polyseg_compute_budget: Optional[float] = None
+
+    # Statistical normalization for the adaptive selector. The dependence-
+    # aware effective-round convention is the research default.
+    polyseg_selector_norm: str = "effective_round"
+
+    # Behavior when remaining feedback budget cannot fund a complete batch.
+    # ``error`` is fail-closed; ``skip`` records missing feedback and does
+    # not issue a verifier query.
+    polyseg_budget_fallback: str = "error"
+
+    # Feedback protocol used by the controller's bound factor.
+    polyseg_feedback: str = "sum"
+
+    # Feature width used in the finite candidate feasibility check.
+    polyseg_feature_dim: int = 4
+
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     standalone_gpu_memory_utilization: Optional[float] = None
