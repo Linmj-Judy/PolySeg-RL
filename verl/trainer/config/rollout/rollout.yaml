@@ -78,6 +78,21 @@ polyseg_feedback: sum
 # Frozen feature width used for candidate feasibility.
 polyseg_feature_dim: 4
 
+# Optional serialized frozen low-dimensional representation for raw rollout
+# hidden states. Empty means external features must already be normalized.
+polyseg_representation_path: null
+
+# SHA-256 fingerprint of the serialized representation. Checked fail-closed.
+polyseg_representation_hash: ""
+
+# Event-boundary science runs require a harness-owned recoverable
+# boundary/hidden/kernel snapshot. Ordinary tool-agent rollouts keep this
+# disabled and record an explicit unavailable status.
+polyseg_require_boundary_snapshots: false
+
+# Harness-owned provider factory/object for recoverable tool-agent snapshots.
+polyseg_boundary_state_provider_path: null
+
 # for vllm rollout
 # Rollout model parameters type. Align with actor model's FSDP/Megatron type.
 dtype: bfloat16

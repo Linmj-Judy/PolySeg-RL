@@ -72,3 +72,11 @@ def test_polyseg_macro_count_ignores_padding_and_observation_ids():
     assert _count_valid_segments(ids, mask).item() == 3
     feedback = torch.tensor([[True, False], [True, False]])
     assert _count_valid_segments(ids, mask, feedback).item() == 2
+
+
+def test_polyseg_macro_count_pads_ragged_feedback_mask():
+    ids = torch.tensor([[0, 0, 1, 1, 2, 2]])
+    mask = torch.ones_like(ids, dtype=torch.bool)
+    # Segment 2 has token ids but no transported feedback label.
+    feedback = torch.tensor([[True, True]])
+    assert _count_valid_segments(ids, mask, feedback).item() == 2

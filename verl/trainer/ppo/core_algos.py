@@ -113,6 +113,7 @@ class AdvantageEstimator(str, Enum):
     # path lightweight for trainers that do not use PolySeg.
     POLYSEG = "polyseg"
     POLYSEG_GAE = "polyseg_gae"
+    POLYSEG_SCI = "polyseg_sci"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -162,6 +163,11 @@ def get_adv_estimator_fn(name_or_enum):
             ADV_ESTIMATOR_REGISTRY[name] = polyseg.compute_polyseg_advantage_registered
         if name == AdvantageEstimator.POLYSEG_GAE.value and name not in ADV_ESTIMATOR_REGISTRY:
             ADV_ESTIMATOR_REGISTRY[name] = polyseg.compute_polyseg_gae_advantage_registered
+    if name == AdvantageEstimator.POLYSEG_SCI.value:
+        from verl.trainer.ppo import polyseg_sci
+
+        if name not in ADV_ESTIMATOR_REGISTRY:
+            ADV_ESTIMATOR_REGISTRY[name] = polyseg_sci.compute_polyseg_science_advantage_registered
     if name not in ADV_ESTIMATOR_REGISTRY:
         raise ValueError(f"Unknown advantage estimator simply: {name}")
     return ADV_ESTIMATOR_REGISTRY[name]

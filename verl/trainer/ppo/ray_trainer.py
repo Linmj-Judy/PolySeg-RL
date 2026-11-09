@@ -67,7 +67,12 @@ from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.polyseg_journal import (
     configured_feedback_ledger_path,
+    configured_feedback_journal_path,
+    restore_feedback_journal_snapshot,
+    restore_feedback_ledger_snapshot,
     snapshot_feedback_ledger,
+    snapshot_feedback_journal,
+    verify_feedback_journal_snapshot,
     verify_feedback_ledger_snapshot,
 )
 from verl.utils.py_functional import rename_dict
@@ -250,6 +255,23 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.POLYSEG_SCI or adv_estimator == "polyseg_sci":
+        # PolySeg-Sci consumes a vector of corrected boundary values produced
+        # by the science harness.  It deliberately has no scalar fallback:
+        # omitting endpoint data must fail closed instead of silently training
+        # the old terminal-feedback path.
+        from verl.trainer.ppo.polyseg_sci import compute_polyseg_science_advantage_registered
+
+        advantages, returns = compute_polyseg_science_advantage_registered(
+            token_level_rewards=data.batch.get("token_level_rewards"),
+            response_mask=data.batch["response_mask"],
+            values=data.batch.get("values"),
+            config=config,
+            batch=data.batch,
+            non_tensor_batch=data.non_tensor_batch,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     elif adv_estimator in (AdvantageEstimator.POLYSEG, AdvantageEstimator.POLYSEG_GAE, "polyseg", "polyseg_gae"):
         # Segment rewards, values and masks are carried as optional batch
         # fields.  The registered estimator maps one macro advantage to every
@@ -273,7 +295,10 @@ def compute_advantage(
             for source_key, metric_key in (
                 ("polyseg_critic_mse", "polyseg/critic_mse"),
                 ("polyseg_bellman_residual_mse", "polyseg/bellman_residual_mse"),
+                ("polyseg_bellman_closure_residual", "polyseg/bellman_closure_residual"),
                 ("polyseg_confidence_bonus", "polyseg/confidence_bonus"),
+                ("polyseg_confidence_radius", "polyseg/confidence_radius"),
+                ("polyseg_confidence_delta", "polyseg/confidence_delta"),
                 ("polyseg_confidence_pre_update", "polyseg/confidence_pre_update"),
                 ("polyseg_feature_condition", "polyseg/feature_condition"),
                 ("polyseg_feature_min_eigenvalue", "polyseg/feature_min_eigenvalue"),
@@ -290,6 +315,11 @@ def compute_advantage(
                 ("polyseg_kappa_segment_selected_upper", "polyseg/kappa_segment_selected_upper"),
                 ("polyseg_kappa_trajectory", "polyseg/kappa_trajectory"),
                 ("polyseg_kappa_trajectory_upper", "polyseg/kappa_trajectory_upper"),
+                ("polyseg_nominal_observations", "polyseg/nominal_observations"),
+                ("polyseg_dependence_cluster_count", "polyseg/dependence_cluster_count"),
+                ("polyseg_total_observation_weight", "polyseg/total_observation_weight"),
+                ("polyseg_weighted_ess_ratio", "polyseg/weighted_ess_ratio"),
+                ("polyseg_dependence_weighted_by_duration", "polyseg/dependence_weighted_by_duration"),
                 ("polyseg_effective_samples", "polyseg/dependence_effective_samples"),
                 ("polyseg_weighted_effective_samples", "polyseg/weighted_effective_samples"),
                 ("polyseg_iid_cluster_radius_ratio", "polyseg/iid_cluster_radius_ratio"),
@@ -299,7 +329,14 @@ def compute_advantage(
                 ("polyseg_dependence_diagnostic_oof", "polyseg/dependence_diagnostic_oof"),
                 ("polyseg_dependence_residual_rms", "polyseg/dependence_residual_rms"),
                 ("polyseg_dependence_radius_multiplier", "polyseg/dependence_radius_multiplier"),
+                ("polyseg_dependence_radius_multiplier_pre_update", "polyseg/dependence_radius_multiplier_pre_update"),
+                ("polyseg_dependence_radius_multiplier_post_update", "polyseg/dependence_radius_multiplier_post_update"),
+                ("polyseg_confidence_radius_pre_update", "polyseg/confidence_radius_pre_update"),
+                ("polyseg_confidence_radius_post_update", "polyseg/confidence_radius_post_update"),
+                ("polyseg_dependence_state_batches", "polyseg/dependence_state_batches"),
                 ("polyseg_dependence_logistic_score", "polyseg/dependence_logistic_score"),
+                ("polyseg_dependence_persistent_oof", "polyseg/dependence_persistent_oof"),
+                ("polyseg_dependence_history_trajectories", "polyseg/dependence_history_trajectories"),
             ):
                 if source_key in data.non_tensor_batch:
                     data.meta_info.setdefault("polyseg_metrics", {})[metric_key] = float(
@@ -669,6 +706,27 @@ class RayPPOTrainer:
         """
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+        # Legacy colocated reward is computed after rollout generation, so the
+        # rollout manager cannot observe its measured cost.  Charge the
+        # shared adaptive controller only after reward completion; streaming
+        # reward workers account during AgentLoop generation and are excluded
+        # here to prevent double charging.
+        controller = getattr(self.agent_loop_manager, "polyseg_controller", None)
+        if controller is not None and getattr(self.reward_loop_manager, "reward_loop_worker_handles", None) is None:
+            actual = batch_reward.non_tensor_batch.get("polyseg_adaptive_actual_cost")
+            if actual is None:
+                actual = batch_reward.non_tensor_batch.get("segment_query_cost")
+            try:
+                actual_total = float(np.asarray(actual, dtype=np.float64).reshape(-1).sum())
+            except (TypeError, ValueError):
+                actual_total = 0.0
+            planned_compute = batch_reward.non_tensor_batch.get("polyseg_adaptive_compute_cost")
+            try:
+                compute_total = float(np.asarray(planned_compute, dtype=np.float64).reshape(-1).sum())
+            except (TypeError, ValueError):
+                compute_total = 0.0
+            if not bool(batch.meta_info.get("validate", False)):
+                controller.observe(actual_total, compute_cost=compute_total, episodes=len(batch))
         return batch_reward
 
     def _validate(self, merged: bool = False):
@@ -1127,6 +1185,14 @@ class RayPPOTrainer:
                 polyseg_estimator_state_dict(),
                 os.path.join(local_global_step_folder, "polyseg_estimator.pt"),
             )
+        if polyseg_config.get("use_confidence_bonus", False):
+            from verl.trainer.ppo.polyseg import polyseg_dependence_state_dict
+
+            torch.save(
+                polyseg_dependence_state_dict(),
+                os.path.join(local_global_step_folder, "polyseg_dependence.pt"),
+            )
+            logger.info("Saved PolySeg dependence/confidence state")
 
         controller = getattr(getattr(self, "agent_loop_manager", None), "polyseg_controller", None)
         if controller is None:
@@ -1143,6 +1209,17 @@ class RayPPOTrainer:
                 print("Saved PolySeg feedback-ledger snapshot")
             except FileNotFoundError:
                 print("Warning: configured PolySeg feedback ledger is missing; checkpoint is not ledger-resumable")
+
+        journal_path = configured_feedback_journal_path(self.config)
+        if journal_path is not None:
+            journal_snapshot_path = os.path.join(local_global_step_folder, "polyseg_feedback_journal.json")
+            try:
+                snapshot_feedback_journal(journal_path, journal_snapshot_path)
+                print("Saved PolySeg feedback-journal checkpoint cursor")
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "configured PolySeg feedback journal is missing; refusing to create a non-resumable checkpoint"
+                ) from error
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1163,10 +1240,13 @@ class RayPPOTrainer:
     def _load_checkpoint(self):
         self._pending_polyseg_controller_state = None
         polyseg_config = self.config.get("algorithm", {}).get("polyseg", {})
-        if polyseg_config.get("accumulate_estimator", False):
-            from verl.trainer.ppo.polyseg import reset_polyseg_estimator_state
+        if polyseg_config.get("accumulate_estimator", False) or polyseg_config.get("use_confidence_bonus", False):
+            from verl.trainer.ppo.polyseg import reset_polyseg_estimator_state, reset_polyseg_dependence_state
 
-            reset_polyseg_estimator_state()
+            if polyseg_config.get("accumulate_estimator", False):
+                reset_polyseg_estimator_state()
+            if polyseg_config.get("use_confidence_bonus", False):
+                reset_polyseg_dependence_state()
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -1217,14 +1297,30 @@ class RayPPOTrainer:
             print("Restored PolySeg adaptive selector state")
 
         ledger_path = configured_feedback_ledger_path(self.config)
+        journal_path = configured_feedback_journal_path(self.config)
+        journal_snapshot_path = os.path.join(global_step_folder, "polyseg_feedback_journal.json")
+        if journal_path is not None:
+            if not os.path.isfile(journal_snapshot_path):
+                raise RuntimeError(
+                    "checkpoint is missing polyseg_feedback_journal.json while a shared feedback journal is configured"
+                )
+            verify_feedback_journal_snapshot(journal_path, journal_snapshot_path)
         ledger_snapshot_path = os.path.join(global_step_folder, "polyseg_feedback_ledger.json")
         if ledger_path is not None:
             if not os.path.exists(ledger_snapshot_path):
                 raise RuntimeError(
                     "checkpoint is missing polyseg_feedback_ledger.json while a shared feedback ledger is configured"
                 )
+
+        if journal_path is not None:
+            restored = restore_feedback_journal_snapshot(journal_path, journal_snapshot_path)
+            if restored["truncated_bytes"]:
+                print(f"Removed {restored['truncated_bytes']} post-checkpoint feedback-journal bytes before resume")
+
+        if ledger_path is not None:
+            restore_feedback_ledger_snapshot(ledger_path, ledger_snapshot_path)
             verify_feedback_ledger_snapshot(ledger_path, ledger_snapshot_path)
-            print("Verified PolySeg feedback-ledger snapshot before resume")
+            print("Restored and verified PolySeg feedback-ledger snapshot before resume")
 
         if polyseg_config.get("accumulate_estimator", False):
             polyseg_state_path = os.path.join(global_step_folder, "polyseg_estimator.pt")
@@ -1234,6 +1330,21 @@ class RayPPOTrainer:
                 load_polyseg_estimator_state_dict(torch.load(polyseg_state_path, weights_only=False), clear=True)
             else:
                 print(f"Warning: No PolySeg estimator state found at {polyseg_state_path}; starting from scratch")
+
+        if polyseg_config.get("use_confidence_bonus", False):
+            polyseg_dependence_path = os.path.join(global_step_folder, "polyseg_dependence.pt")
+            if os.path.exists(polyseg_dependence_path):
+                from verl.trainer.ppo.polyseg import load_polyseg_dependence_state_dict
+
+                load_polyseg_dependence_state_dict(
+                    torch.load(polyseg_dependence_path, weights_only=False), clear=True
+                )
+                print("Restored PolySeg dependence/confidence state")
+            else:
+                print(
+                    f"Warning: No PolySeg dependence state found at {polyseg_dependence_path}; "
+                    "starting confidence radius from its prior"
+                )
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))

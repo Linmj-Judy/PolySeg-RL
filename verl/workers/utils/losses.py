@@ -49,7 +49,15 @@ def _count_valid_segments(
         active = ids[mask & (ids >= 0)]
         if segment_feedback_mask is not None and active.numel():
             feedback = segment_feedback_mask[row].to(torch.bool)
-            active = active[feedback[active.clamp_min(0)]]
+            # Ragged TransferQueue microbatches may carry a feedback mask
+            # narrower than the token-aligned segment ids.  Missing entries
+            # are unqueried and must be excluded without indexing past the
+            # transported mask.
+            in_range = active < feedback.shape[0]
+            labels = torch.zeros_like(in_range)
+            if torch.any(in_range):
+                labels[in_range] = feedback[active[in_range]]
+            active = active[labels]
         counts.append(torch.as_tensor(torch.unique(active).numel(), device=segment_ids.device))
     return torch.stack(counts).sum() if counts else segment_ids.new_zeros(())
 

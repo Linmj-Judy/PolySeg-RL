@@ -16,7 +16,11 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.utils.polyseg_feedback import is_validation_batch
+from verl.utils.polyseg_feedback import (
+    billing_receipt_journal_entries,
+    is_validation_batch,
+    settle_feedback_cost,
+)
 from verl.utils.polyseg_journal import append_feedback_record
 from verl.trainer.ppo.polyseg import (
     FileBackedSegmentRewardBudget,
@@ -26,7 +30,9 @@ from verl.trainer.ppo.polyseg import (
     decode_token_ids,
     extract_segment_metadata,
     feature_map_contract,
+    feedback_protocol_contract,
     normalize_feedback_protocol,
+    resolve_polyseg_option,
 )
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
@@ -49,6 +55,33 @@ def _scalar(value: Any, default: Any):
     return default if value is None else value
 
 
+def _resource_accounting(item, *, prompt_length: int, valid_mask: torch.Tensor,
+                         action_mask: torch.Tensor, extra: dict[str, Any]) -> dict[str, int]:
+    """Return a per-trajectory realized token/tool ledger for the journal."""
+    attention = item.batch["attention_mask"][:prompt_length].to(torch.bool).cpu()
+    prompt_tokens = int(attention.sum().item())
+    response_tokens = int(valid_mask.to(torch.bool).sum().item())
+    action_tokens = int((action_mask.to(torch.bool) & valid_mask.to(torch.bool)).sum().item())
+    tool_calls_value = extra.get("tool_call_count")
+    if tool_calls_value is None:
+        calls = extra.get("segment_tool_calls", [])
+        tool_calls_value = sum(len(value) for value in calls) if isinstance(calls, (list, tuple)) else 0
+    tool_calls = int(_scalar(tool_calls_value, 0))
+    successes = int(_scalar(extra.get("tool_call_success_count"), 0))
+    failures_value = extra.get("tool_call_failure_count")
+    failures = int(_scalar(failures_value, max(tool_calls - successes, 0)))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "response_tokens": response_tokens,
+        "action_tokens": action_tokens,
+        "tool_observation_tokens": response_tokens - action_tokens,
+        "total_tokens": prompt_tokens + response_tokens,
+        "tool_calls": tool_calls,
+        "tool_successes": successes,
+        "tool_failures": failures,
+    }
+
+
 @register("polyseg")
 class PolySegRewardManager(AbstractRewardManager):
     """Compute one verifier feedback value for each rollout-owned segment."""
@@ -61,7 +94,11 @@ class PolySegRewardManager(AbstractRewardManager):
         cfg = kwargs.get("polyseg_config", {}) or {}
 
         def get_value(key, default):
-            return kwargs[key] if kwargs.get(key) is not None else cfg.get(key, default)
+            if kwargs.get(key) is not None:
+                return kwargs[key]
+            if cfg.get(key) is not None:
+                return cfg[key]
+            return resolve_polyseg_option(config, key, default=default)
 
         config = kwargs.get("config")
         rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
@@ -80,12 +117,20 @@ class PolySegRewardManager(AbstractRewardManager):
             # trainer runs always pass the configured rollout horizon.
             self.feature_horizon = None
         self.protocol = normalize_feedback_protocol(get_value("feedback", "local_sum"))
+        self.feedback_contract = feedback_protocol_contract(self.protocol)
         self.budget_limit = get_value("budget", None)
         self.budget_scope = str(get_value("budget_scope", "trajectory")).strip().lower()
         self.segment_cost = float(get_value("segment_cost", 1.0))
         self.budget_fallback = str(get_value("budget_fallback", "error")).strip().lower()
         self.require_rollout_segments = bool(get_value("require_rollout_segments", False))
         self.decode_skip_special_tokens = bool(get_value("decode_skip_special_tokens", True))
+        self.feedback_cost_policy = str(
+            get_value("feedback_cost_policy", "reserve_upper")
+        ).strip().lower()
+        if self.feedback_cost_policy not in {"reserve_upper", "reported_with_receipt"}:
+            raise ValueError(
+                "feedback_cost_policy must be 'reserve_upper' or 'reported_with_receipt'"
+            )
         self.feedback_journal_path = get_value("feedback_journal_path", None)
         self.feedback_ledger_path = get_value("feedback_ledger_path", None)
         self.feedback_attempt_id = get_value("feedback_attempt_id", None)
@@ -123,6 +168,15 @@ class PolySegRewardManager(AbstractRewardManager):
             raise ValueError("m must be >= 1")
         if self.segment_cost <= 0:
             raise ValueError("segment_cost must be > 0")
+
+    def _billed_cost(self, reported_cost: float, info: dict[str, Any]) -> float:
+        """Return the amount to charge for one completed query."""
+        return settle_feedback_cost(
+            info,
+            reported_cost=reported_cost,
+            reserved_cost=self.segment_cost,
+            policy=self.feedback_cost_policy,
+        )
 
     @staticmethod
     def _value(result: Any, *, protocol: str) -> tuple[float, dict[str, Any]]:
@@ -221,15 +275,32 @@ class PolySegRewardManager(AbstractRewardManager):
             # otherwise successor features would be silently dropped unless
             # a dataset happened to duplicate them inside ``extra_info``.
             for key in (
+                "segment_features",
+                "step_features",
                 "segment_next_features",
                 "segment_transition_mask",
                 "segment_action_lengths",
                 "segment_tool_calls",
                 "segment_tool_observations",
+                "tool_observation_mask",
+                "tool_observation_spans",
+                "segment_tool_observation_spans",
+                "segment_action_masks",
+                "segment_action_mask",
+                "tool_call_count",
+                "tool_call_success_count",
+                "tool_call_failure_count",
                 "trajectory_id",
                 "episode_id",
             ):
                 value = item.non_tensor_batch.get(key)
+                if value is None:
+                    try:
+                        value = item.batch.get(key)
+                    except (AttributeError, KeyError):
+                        value = None
+                if torch.is_tensor(value):
+                    value = value.detach().cpu().numpy()
                 if key in {"trajectory_id", "episode_id"} and isinstance(value, np.ndarray) and value.size == 1:
                     value = value.reshape(-1)[0]
                     value = value.item() if hasattr(value, "item") else value
@@ -297,7 +368,7 @@ class PolySegRewardManager(AbstractRewardManager):
                     continue
                 if self.protocol == "terminal" and segment_id < segment_count - 1:
                     values.append(0.0)
-                    infos.append({})
+                    infos.append({"feedback_status": "unqueried_terminal", "query_cost": 0.0})
                     continue
                 if local_budget is not None and not local_budget.can_afford(cost=self.segment_cost):
                     if self.budget_fallback == "skip":
@@ -375,8 +446,12 @@ class PolySegRewardManager(AbstractRewardManager):
                 try:
                     result = self.compute_score(data_source, segment_text, ground_truth, extra)
                 except Exception:
+                    # A raised exception is not evidence that the provider did
+                    # not bill the request.  The conservative default keeps the
+                    # full reservation charged; only an explicit pre-submit
+                    # failure may be refunded by the caller.
                     if self.global_budget is not None and reservation_token is not None:
-                        self.global_budget.refund_reservation(reservation_token)
+                        self.global_budget.commit(reservation_token, cost=self.segment_cost)
                     raise
                 try:
                     value, info = self._value(result, protocol=self.protocol)
@@ -384,6 +459,7 @@ class PolySegRewardManager(AbstractRewardManager):
                     if self.global_budget is not None and reservation_token is not None:
                         self.global_budget.commit(reservation_token, cost=self.segment_cost)
                     raise
+                info.setdefault("feedback_protocol_contract", dict(self.feedback_contract))
                 info.setdefault("budget_reservation_id", reservation_token)
                 raw_cost = info.get("query_cost", self.segment_cost)
                 try:
@@ -403,24 +479,30 @@ class PolySegRewardManager(AbstractRewardManager):
                         "PolySeg scorer query_cost exceeds configured segment_cost; "
                         "set segment_cost to the maximum verifier/suffix query cost"
                     )
-                if local_budget is not None and not local_budget.can_afford(cost=query_cost):
+                # A scorer-reported lower cost is only an authoritative bill
+                # when it carries a provider receipt and the configured policy
+                # allows it.  Otherwise the reserved upper bound is charged,
+                # which prevents a buggy/hostile scorer from creating budget.
+                billed_cost = self._billed_cost(query_cost, info)
+                if local_budget is not None and not local_budget.can_afford(cost=billed_cost):
                     if self.global_budget is not None and reservation_token is not None:
-                        self.global_budget.commit(reservation_token, cost=query_cost)
+                        self.global_budget.commit(reservation_token, cost=billed_cost)
                     raise RuntimeError(
                         "PolySeg scorer exceeded the per-trajectory feedback budget: "
-                        f"requested={query_cost}, remaining={local_budget.remaining}"
+                        f"requested={billed_cost}, remaining={local_budget.remaining}"
                     )
                 values.append(value)
                 infos.append(info)
                 query_count += 1
-                query_cost_total += query_cost
+                query_cost_total += billed_cost
                 if local_budget is not None:
-                    local_budget.consume(cost=query_cost)
+                    local_budget.consume(cost=billed_cost)
                 if self.global_budget is not None and reservation_token is not None:
-                    self.global_budget.commit(reservation_token, cost=query_cost)
+                    self.global_budget.commit(reservation_token, cost=billed_cost)
 
+            raw_feedback_mean = float(np.mean(values)) if values else 0.0
             rewards = compute_segment_rewards(values, self.protocol)
-            total_reward = float(np.mean(rewards)) if self.protocol == "mean" else float(sum(rewards))
+            total_reward = float(sum(rewards))
             # Legacy token reward is a compatibility projection. PolySeg's
             # estimator reads segment_rewards; each segment reward is written
             # once at its final valid action token.
@@ -430,26 +512,50 @@ class PolySegRewardManager(AbstractRewardManager):
                 if positions.numel():
                     reward_tensor[i, int(positions[-1])] = rewards[segment_id]
 
-            segment_features = build_segment_features(
-                        boundaries,
-                        segment_durations,
-                        response_length=response_length,
-                        action_lengths=base_extra.get("segment_action_lengths"),
-                        tool_call_counts=[
-                            len(calls) if isinstance(calls, (list, tuple)) else 0
-                            for calls in (
-                                base_extra.get("segment_tool_calls", [])
-                                if isinstance(base_extra.get("segment_tool_calls", []), (list, tuple))
-                                else []
-                            )
-                        ]
-                        or [0] * segment_count,
-                        feature_dim=self.feature_dim,
-                        feature_horizon=self.feature_horizon,
-                    ).numpy().astype(np.float32)
-            feature_contract = feature_map_contract(
-                response_length=self.feature_horizon or response_length,
-                feature_dim=self.feature_dim,
+            rollout_features = base_extra.get("segment_features")
+            if rollout_features is not None:
+                segment_features = np.asarray(rollout_features, dtype=np.float32)
+                if segment_features.ndim == 3 and segment_features.shape[0] == 1:
+                    segment_features = segment_features[0]
+                if segment_features.ndim != 2 or segment_features.shape != (segment_count, self.feature_dim):
+                    raise ValueError(
+                        "rollout segment_features must have shape "
+                        f"({segment_count}, {self.feature_dim})"
+                    )
+                if not np.isfinite(segment_features).all():
+                    raise ValueError("rollout segment_features must be finite")
+            else:
+                segment_features = build_segment_features(
+                            boundaries,
+                            segment_durations,
+                            response_length=response_length,
+                            action_lengths=base_extra.get("segment_action_lengths"),
+                            tool_call_counts=[
+                                len(calls) if isinstance(calls, (list, tuple)) else 0
+                                for calls in (
+                                    base_extra.get("segment_tool_calls", [])
+                                    if isinstance(base_extra.get("segment_tool_calls", []), (list, tuple))
+                                    else []
+                                )
+                            ]
+                            or [0] * segment_count,
+                            feature_dim=self.feature_dim,
+                            feature_horizon=self.feature_horizon,
+                        ).numpy().astype(np.float32)
+            representation_hash = _scalar(base_extra.get("polyseg_representation_hash"), None)
+            feature_contract = (
+                {
+                    "version": "polyseg-frozen-lowdim-v1",
+                    "hash": str(representation_hash),
+                    "semantic_role": "frozen_rollout_representation",
+                    "causal_availability": "available_at_segment_boundary",
+                    "markov_sufficiency": "not_established",
+                }
+                if representation_hash
+                else feature_map_contract(
+                    response_length=self.feature_horizon or response_length,
+                    feature_dim=self.feature_dim,
+                )
             )
             per_sample_segment_data.append(
                 {
@@ -457,12 +563,25 @@ class PolySegRewardManager(AbstractRewardManager):
                     "segment_durations": segment_durations.numpy().astype(np.float32),
                     "segment_mask": np.ones(segment_count, dtype=np.bool_),
                     "segment_feedback_mask": np.asarray(
-                        [info.get("feedback_status") != "skipped_budget" for info in infos], dtype=np.bool_
+                        [info.get("feedback_status") not in {"skipped_budget", "unqueried_terminal"} for info in infos], dtype=np.bool_
                     ),
                     "segment_ids": segment_ids.numpy().astype(np.int64),
                     "segment_features": segment_features,
+                    **(
+                        {"polyseg_representation_hash": str(representation_hash)}
+                        if representation_hash
+                        else {}
+                    ),
+                    **(
+                        {"step_features": np.asarray(base_extra["step_features"], dtype=np.float32)}
+                        if "step_features" in base_extra
+                        else {}
+                    ),
                     "polyseg_feature_map_version": feature_contract["version"],
                     "polyseg_feature_map_hash": feature_contract["hash"],
+                    "polyseg_feature_semantic_role": feature_contract["semantic_role"],
+                    "polyseg_feature_causal_availability": feature_contract["causal_availability"],
+                    "polyseg_feature_markov_sufficiency": feature_contract["markov_sufficiency"],
                     # A theorem-aligned transition estimator requires
                     # rollout-owned next-boundary features.  Do not synthesize
                     # them by shifting the current segment summaries.
@@ -483,6 +602,7 @@ class PolySegRewardManager(AbstractRewardManager):
             extras["episode_reward"].append(total_reward)
             extras["segment_reward_sum"].append(float(sum(rewards)))
             extras["segment_reward_mean"].append(float(np.mean(rewards)) if rewards else 0.0)
+            extras["segment_feedback_mean"].append(raw_feedback_mean)
             # ``score``/utility and observed correctness are distinct
             # quantities.  Do not fill an absent correctness field with the
             # scorer's utility or with zero; missing remains auditable.
@@ -530,8 +650,17 @@ class PolySegRewardManager(AbstractRewardManager):
                     for j in range(segment_count)
                 ]
             )
+            extras["feedback_protocol_contract"].append(dict(self.feedback_contract))
             extras.setdefault("segment_budget_reservation_ids", []).append(
                 [info.get("budget_reservation_id") for info in infos]
+            )
+            extras.setdefault("billing_receipts", []).append(billing_receipt_journal_entries(infos))
+            resource_accounting = _resource_accounting(
+                item,
+                prompt_length=item.batch["prompts"].shape[-1],
+                valid_mask=valid_mask,
+                action_mask=action_mask,
+                extra=base_extra,
             )
             append_feedback_record(
                 self.feedback_journal_path, attempt_id=self.feedback_attempt_id,
@@ -539,6 +668,9 @@ class PolySegRewardManager(AbstractRewardManager):
                 query_cost=query_cost_total, query_count=query_count,
                 segment_count=segment_count, skipped_count=len(fallback_segments),
                 budget_scope=self.budget_scope, global_budget=self.global_budget,
+                resource_accounting=resource_accounting,
+                billing_receipts=billing_receipt_journal_entries(infos),
+                feedback_contract=self.feedback_contract,
             )
 
         max_segments = max((len(row["segment_rewards"]) for row in per_sample_segment_data), default=0)
@@ -566,6 +698,15 @@ class PolySegRewardManager(AbstractRewardManager):
         extras["polyseg_feature_map_hash"] = [
             row["polyseg_feature_map_hash"] for row in per_sample_segment_data
         ]
+        extras["polyseg_feature_semantic_role"] = [
+            row["polyseg_feature_semantic_role"] for row in per_sample_segment_data
+        ]
+        extras["polyseg_feature_causal_availability"] = [
+            row["polyseg_feature_causal_availability"] for row in per_sample_segment_data
+        ]
+        extras["polyseg_feature_markov_sufficiency"] = [
+            row["polyseg_feature_markov_sufficiency"] for row in per_sample_segment_data
+        ]
         extras["segment_features"] = [
             np.pad(
                 row["segment_features"],
@@ -574,6 +715,24 @@ class PolySegRewardManager(AbstractRewardManager):
             ).astype(np.float32)
             for row in per_sample_segment_data
         ]
+        if any("polyseg_representation_hash" in row for row in per_sample_segment_data):
+            if not all("polyseg_representation_hash" in row for row in per_sample_segment_data):
+                raise ValueError("representation hash must be present for every sample with frozen features")
+            extras["polyseg_representation_hash"] = [
+                row["polyseg_representation_hash"] for row in per_sample_segment_data
+            ]
+        if any("step_features" in row for row in per_sample_segment_data):
+            if not all("step_features" in row for row in per_sample_segment_data):
+                raise ValueError("step_features must be present for every sample when shared-step recovery is used")
+            max_steps = max(int(row["step_features"].shape[0]) for row in per_sample_segment_data)
+            extras["step_features"] = [
+                np.pad(
+                    row["step_features"],
+                    ((0, max_steps - row["step_features"].shape[0]), (0, 0)),
+                    constant_values=0.0,
+                ).astype(np.float32)
+                for row in per_sample_segment_data
+            ]
         extras["segment_next_features"] = [
             np.pad(
                 row["segment_next_features"],

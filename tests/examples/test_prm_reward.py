@@ -27,3 +27,4 @@ def test_prm_final_accuracy_accepts_structured_math_dapo_verifier(monkeypatch):
     assert result["acc"] == 0.0
     assert result["verifier_score"] == -1.0
     assert result["verifier_pred"] == "wrong"
+    assert result["feedback_protocol_contract"]["label_semantics"] == "prm_model_derived_pseudo_label"

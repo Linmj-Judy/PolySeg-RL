@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+import json
 
 from verl import DataProto
 from verl.trainer.ppo.polyseg import compute_segment_rewards
@@ -121,6 +122,44 @@ def test_reward_manager_uses_rollout_segments_and_isolates_budget():
     assert result["reward_tensor"][0].tolist() == [0.0, 1.0, 0.0, 2.0]
 
 
+def test_reward_manager_dispatches_configured_reward_fn_key():
+    seen = []
+
+    def score(data_source, solution_str, ground_truth, extra_info):
+        seen.append(data_source)
+        return {"score": 1.0, "acc": 1.0}
+
+    data = _data(batch_size=1)
+    data.non_tensor_batch.pop("data_source")
+    data.non_tensor_batch["task_source"] = np.asarray(["custom/task"], dtype=object)
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=score,
+        reward_fn_key="task_source",
+        polyseg_config={"m": 2, "feedback": "local_sum"},
+        require_rollout_segments=True,
+    )
+    result = manager(data, return_dict=True)
+    assert result["reward_extra_info"]["final_accuracy"] == [1.0]
+    assert seen == ["custom/task", "custom/task"]
+
+
+def test_reward_manager_missing_configured_reward_fn_key_fails_closed():
+    data = _data(batch_size=1)
+    data.non_tensor_batch.pop("data_source")
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=lambda *args, **kwargs: {"score": 1.0},
+        reward_fn_key="task_source",
+        polyseg_config={"m": 2, "feedback": "local_sum"},
+        require_rollout_segments=True,
+    )
+    with pytest.raises(KeyError, match="task_source"):
+        manager(data, return_dict=True)
+
+
 def test_reward_manager_preserves_direct_rollout_successor_fields():
     fields = {
         "prompts": torch.zeros((1, 2), dtype=torch.long),
@@ -159,6 +198,8 @@ def test_reward_manager_uses_fixed_feature_horizon_for_ragged_batches():
     info = result["reward_extra_info"]
     expected = feature_map_contract(response_length=2048, feature_dim=4)["hash"]
     assert info["polyseg_feature_map_hash"] == [expected]
+    assert info["polyseg_feature_causal_availability"] == ["available_at_segment_boundary"]
+    assert info["polyseg_feature_markov_sufficiency"] == ["not_established"]
 
 
 def test_agentic_mode_rejects_missing_rollout_metadata():
@@ -275,3 +316,126 @@ def test_missing_accuracy_is_not_filled_from_utility_score():
     assert info["final_accuracy"] == [None]
     assert info["acc"] == [None]
 
+
+
+def test_terminal_feedback_marks_nonfinal_segments_unqueried():
+    calls = []
+
+    def score(data_source, solution_str, ground_truth, extra_info):
+        calls.append(extra_info["segment_id"])
+        return {"score": 1.0, "acc": 1.0}
+
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(), num_examine=0, compute_score=score,
+        polyseg_config={"m": 2, "feedback": "terminal"}, require_rollout_segments=True,
+    )
+    result = manager(_data(batch_size=1), return_dict=True)
+    assert calls == [1]
+    assert result["reward_extra_info"]["segment_query_count"] == [1]
+    assert [int(x) for x in result["reward_extra_info"]["segment_feedback_mask"][0]] == [0, 1]
+
+
+def test_zero_reported_cost_cannot_create_free_budget():
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(), num_examine=0,
+        compute_score=lambda *a, **k: {"score": 1.0, "query_cost": 0.0},
+        polyseg_config={"m": 2, "feedback": "local_sum", "budget": 4, "segment_cost": 1.0},
+        require_rollout_segments=True,
+    )
+    result = manager(_data(batch_size=1), return_dict=True)
+    # The conservative default charges the reserved upper bound.
+    assert result["reward_extra_info"]["segment_query_cost"] == [2.0]
+
+
+def test_reported_cost_policy_requires_receipt_for_lower_bill():
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=lambda *a, **k: {
+            "score": 1.0,
+            "query_cost": 0.25,
+            "billing_receipt": {"provider_query_id": "q-1", "billed_cost": 0.25},
+        },
+        polyseg_config={
+            "m": 2,
+            "feedback": "local_sum",
+            "budget": 2,
+            "segment_cost": 1.0,
+            "feedback_cost_policy": "reported_with_receipt",
+        },
+        require_rollout_segments=True,
+    )
+    result = manager(_data(batch_size=1), return_dict=True)
+    assert result["reward_extra_info"]["segment_query_cost"] == [0.5]
+    assert result["reward_extra_info"]["segment_budget_remaining"] == [pytest.approx(1.5)]
+
+
+def test_reported_cost_without_receipt_keeps_conservative_bill():
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=lambda *a, **k: {"score": 1.0, "query_cost": 0.25},
+        polyseg_config={
+            "m": 2,
+            "feedback": "local_sum",
+            "budget": 2,
+            "segment_cost": 1.0,
+            "feedback_cost_policy": "reported_with_receipt",
+        },
+        require_rollout_segments=True,
+    )
+    result = manager(_data(batch_size=1), return_dict=True)
+    assert result["reward_extra_info"]["segment_query_cost"] == [2.0]
+    assert result["reward_extra_info"]["segment_budget_remaining"] == [pytest.approx(0.0)]
+
+
+def test_receipt_without_billed_cost_keeps_conservative_bill():
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=lambda *a, **k: {
+            "score": 1.0,
+            "query_cost": 0.25,
+            "billing_receipt": {"provider_query_id": "q-missing-cost"},
+        },
+        polyseg_config={
+            "m": 2,
+            "feedback": "local_sum",
+            "budget": 2,
+            "segment_cost": 1.0,
+            "feedback_cost_policy": "reported_with_receipt",
+        },
+        require_rollout_segments=True,
+    )
+    result = manager(_data(batch_size=1), return_dict=True)
+    info = result["reward_extra_info"]
+    assert info["segment_query_cost"] == [2.0]
+    assert all(item["status"] == "invalid_billed_cost" for item in info["billing_receipts"][0])
+
+
+def test_sync_reward_manager_writes_realized_resource_ledger(tmp_path):
+    journal = tmp_path / "feedback.jsonl"
+    manager = PolySegRewardManager(
+        tokenizer=_DummyTokenizer(),
+        num_examine=0,
+        compute_score=lambda *a, **k: {"score": 1.0},
+        polyseg_config={
+            "m": 2,
+            "feedback": "local_sum",
+            "feedback_journal_path": str(journal),
+            "feedback_attempt_id": "attempt",
+        },
+        require_rollout_segments=True,
+    )
+    manager(_data(batch_size=1), return_dict=True)
+    row = json.loads(journal.read_text().strip())
+    assert row["resource_accounting"] == {
+        "prompt_tokens": 2,
+        "response_tokens": 4,
+        "action_tokens": 4,
+        "tool_observation_tokens": 0,
+        "total_tokens": 6,
+        "tool_calls": 0,
+        "tool_successes": 0,
+        "tool_failures": 0,
+    }

@@ -33,6 +33,9 @@ def build_single_turn_segment_metadata(
     configured_m: int = 0,
     feature_dim: int = 4,
     feature_horizon: int | None = None,
+    state_features: torch.Tensor | None = None,
+    representation=None,
+    state_mask: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build fixed-token PolySeg metadata for one generated response.
 
@@ -65,12 +68,16 @@ def build_single_turn_segment_metadata(
     features = build_segment_features(
         boundaries,
         [1.0] * len(boundaries),
-        response_length=max(int(feature_horizon or response_length), 1),
+        response_length=max(int(response_length), 1),
         action_lengths=[
             sum(1 for position in action_positions if segment_ids[position] == segment_id)
             for segment_id in range(len(boundaries))
         ],
         feature_dim=max(1, int(feature_dim)),
+        feature_horizon=feature_horizon,
+        state_features=state_features,
+        representation=representation,
+        state_mask=state_mask,
     )
     next_features = torch.zeros_like(features)
     transition_mask = [False] * len(boundaries)
@@ -81,12 +88,21 @@ def build_single_turn_segment_metadata(
         "segment_ids": segment_ids,
         "segment_durations": [1.0] * len(boundaries),
         "segment_boundaries": boundaries,
+        "tool_observation_mask": [False] * response_length,
+        "tool_observation_spans": [[] for _ in boundaries],
+        "segment_tool_observation_spans": [[] for _ in boundaries],
+        "segment_action_masks": [
+            [bool(response_mask[position]) for position in range(start, end)]
+            for start, end in boundaries
+        ],
+        "segment_action_mask": [bool(value) for value in response_mask],
         "segment_action_lengths": [
             sum(1 for position in action_positions if segment_ids[position] == segment_id)
             for segment_id in range(len(boundaries))
         ],
         "segment_tool_calls": [[] for _ in boundaries],
         "segment_tool_observations": [[] for _ in boundaries],
+        "segment_features": features.tolist(),
         "segment_next_features": next_features.tolist(),
         "segment_transition_mask": transition_mask,
     }
@@ -185,11 +201,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if hasattr(configured_m, "item"):
             configured_m = configured_m.item()
         configured_m = int(configured_m or 0)
+        mapped_step_features, state_features, representation, representation_hash = self._prepare_polyseg_step_features(
+            kwargs, response_length
+        )
         metadata = build_single_turn_segment_metadata(
             output.response_mask,
             configured_m,
             feature_dim=max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4))),
             feature_horizon=self.response_length,
+            state_features=state_features if state_features is not None else mapped_step_features,
+            representation=representation,
+            state_mask=torch.as_tensor(output.response_mask, dtype=torch.bool),
         )
         output.extra_fields.update(
             {
@@ -205,6 +227,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 ],
             }
         )
+        if mapped_step_features is not None:
+            output.extra_fields["step_features"] = mapped_step_features.tolist()
+            output.extra_fields["polyseg_representation_hash"] = representation_hash
         for key in (
             "polyseg_adaptive_q",
             "polyseg_adaptive_m",

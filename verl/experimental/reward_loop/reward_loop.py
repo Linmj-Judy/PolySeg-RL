@@ -375,6 +375,7 @@ class RewardLoopManager:
             "segment_mask",
             "segment_feedback_mask",
             "segment_features",
+            "step_features",
             "segment_next_features",
             "segment_transition_mask",
         }
@@ -394,7 +395,7 @@ class RewardLoopManager:
                 fill_value, dtype = 0, torch.long
             else:
                 fill_value, dtype = 0.0, torch.float32
-            if key in {"segment_features", "segment_next_features"}:
+            if key in {"segment_features", "step_features", "segment_next_features"}:
                 max_len = max(len(value) for value in values)
                 feature_dim = max(np.asarray(value).shape[-1] for value in values)
                 padded = np.full(

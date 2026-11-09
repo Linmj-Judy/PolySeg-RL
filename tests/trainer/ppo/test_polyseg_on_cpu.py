@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -32,15 +33,22 @@ from verl.trainer.ppo.polyseg import (
     confidence_bonus,
     transition_confidence_bonus,
     PolynomialEstimatorState,
+    PolySegDependenceState,
     PolySegConfig,
     load_polyseg_estimator_state_dict,
     polyseg_estimator_state_dict,
     reset_polyseg_estimator_state,
+    reset_polyseg_dependence_state,
+    polyseg_dependence_state_dict,
+    load_polyseg_dependence_state_dict,
     compute_segment_rewards,
+    extract_segment_metadata,
     normalize_feedback_protocol,
+    feedback_protocol_contract,
     cross_fitted_segment_residuals,
     cross_fitted_logistic_segment_residuals,
     estimate_dependence_diagnostics,
+    segment_feedback_bound,
 )
 
 
@@ -58,6 +66,63 @@ def test_segment_partition_and_scatter():
     assert make_segment_slices(10, 3) == [(0, 4), (4, 7), (7, 10)]
     ids = segment_ids(10, 3)
     assert ids.tolist() == [0, 0, 0, 0, 1, 1, 1, 2, 2, 2]
+
+
+def test_rollout_boundaries_are_checked_against_token_segment_ids():
+    item = SimpleNamespace(
+        non_tensor_batch={
+            "extra_fields": {
+                "segment_ids": [0, 0, 1, 1],
+                "segment_boundaries": [(0, 3), (2, 4)],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="non-overlapping"):
+        extract_segment_metadata(
+            item,
+            response_length=4,
+            valid_response_mask=torch.ones(4, dtype=torch.bool),
+            require_rollout_segments=True,
+        )
+
+    item.non_tensor_batch["extra_fields"]["segment_ids"] = [0, 0, 1, 1, 1]
+    item.non_tensor_batch["extra_fields"]["segment_boundaries"] = [(0, 2), (2, 5)]
+    with pytest.raises(ValueError, match="token-aligned"):
+        extract_segment_metadata(
+            item,
+            response_length=4,
+            valid_response_mask=torch.ones(4, dtype=torch.bool),
+            require_rollout_segments=True,
+        )
+
+    item.non_tensor_batch["extra_fields"]["segment_boundaries"] = [(0, 2), (2, 4)]
+    item.non_tensor_batch["extra_fields"]["segment_ids"] = [-1, 0, 1, 1]
+    with pytest.raises(ValueError, match="non-negative"):
+        extract_segment_metadata(
+            item,
+            response_length=4,
+            valid_response_mask=torch.ones(4, dtype=torch.bool),
+            require_rollout_segments=True,
+        )
+
+    item.non_tensor_batch["extra_fields"]["segment_ids"] = [0, 0, 1, 1]
+    item.non_tensor_batch["extra_fields"]["segment_boundaries"] = [(0, 2), (2, 5)]
+    with pytest.raises(ValueError, match="response bounds"):
+        extract_segment_metadata(
+            item,
+            response_length=4,
+            valid_response_mask=torch.ones(4, dtype=torch.bool),
+            require_rollout_segments=True,
+        )
+
+    item.non_tensor_batch["extra_fields"]["segment_boundaries"] = [(0, 1), (1, 4)]
+    with pytest.raises(ValueError, match="does not cover"):
+        extract_segment_metadata(
+            item,
+            response_length=4,
+            valid_response_mask=torch.ones(4, dtype=torch.bool),
+            require_rollout_segments=True,
+        )
 
 
 def test_prm_potential_protocol_is_explicit_and_telescopes():
@@ -92,6 +157,23 @@ def test_binary_feedback_is_a_thresholded_macro_protocol():
     assert compute_segment_rewards([0.2, 0.8], "binary_local") == [0.0, 1.0]
 
 
+def test_feedback_protocol_contract_separates_binary_and_prm_semantics():
+    binary = feedback_protocol_contract("binary")
+    prm = feedback_protocol_contract("prm")
+    synthetic = feedback_protocol_contract("terminal")
+    assert binary["protocol"] == "binary_local"
+    assert binary["label_semantics"] == "deterministic_prefix_verifier"
+    assert binary["label_semantics"] != "stochastic_bernoulli_observation"
+    assert prm["protocol"] == "prm_potential"
+    assert prm["label_semantics"] == "prm_model_derived_pseudo_label"
+    assert prm["reward_aggregation"] == "adjacent_potential_difference"
+    assert prm["reward_sign"] == "signed"
+    assert prm["normalization"] == "potential_difference_preserves_telescoping"
+    assert synthetic["label_semantics"] == "deterministic_terminal_verifier"
+    assert synthetic["reward_aggregation"] == "terminal_sparse_anchor"
+    assert synthetic["normalization"] == "no_segment_count_rescaling"
+
+
 def test_frozen_segment_feature_map_is_bounded_and_stable():
     features = build_segment_features(
         [(0, 2), (2, 5)],
@@ -117,6 +199,9 @@ def test_frozen_segment_feature_map_is_bounded_and_stable():
 def test_feature_map_contract_is_content_addressed_and_scale_stable():
     contract = feature_map_contract(response_length=128, feature_dim=5)
     assert contract["version"] == "polyseg-fixed-boundary-summary-v1"
+    assert contract["semantic_role"] == "rollout_observable_boundary_state_action_summary"
+    assert contract["causal_availability"] == "available_at_segment_boundary"
+    assert contract["markov_sufficiency"] == "not_established"
     assert len(contract["hash"]) == 64
     assert contract == feature_map_contract(response_length=128, feature_dim=5)
     assert contract["hash"] != feature_map_contract(response_length=256, feature_dim=5)["hash"]
@@ -165,6 +250,32 @@ def test_dependence_diagnostics_use_cross_fitted_scores_and_cluster_bootstrap():
     assert diagnostics["kappa_trajectory_upper"] >= diagnostics["kappa_trajectory"]
     assert diagnostics["bootstrap_samples"] == 32
     assert diagnostics["segment_count"] == 12
+    assert diagnostics["nominal_observations"] == 12
+    assert diagnostics["cluster_count"] == 4
+    assert diagnostics["total_observation_weight"] == pytest.approx(16.0)
+    assert diagnostics["weighted_ess_ratio"] == pytest.approx(
+        diagnostics["weighted_effective_samples"] / diagnostics["nominal_observations"]
+    )
+
+
+def test_weighted_ess_is_invariant_to_global_weight_scale():
+    scores = np.asarray(
+        [
+            [[-1.0], [0.0], [1.0]],
+            [[-0.5], [0.5], [1.5]],
+            [[0.2], [0.8], [1.2]],
+            [[-1.2], [0.1], [0.9]],
+        ],
+        dtype=np.float64,
+    )
+    weights = np.asarray([[1.0, 2.0, 1.0]] * 4)
+    first = estimate_dependence_diagnostics(scores, weights=weights, bootstrap_samples=0, hac_lag=1)
+    scaled = estimate_dependence_diagnostics(scores, weights=weights * 7.0, bootstrap_samples=0, hac_lag=1)
+    assert first["nominal_observations"] == scaled["nominal_observations"] == 12
+    assert first["cluster_count"] == scaled["cluster_count"] == 4
+    assert scaled["total_observation_weight"] == pytest.approx(7.0 * first["total_observation_weight"])
+    assert scaled["weighted_effective_samples"] == pytest.approx(first["weighted_effective_samples"])
+    assert scaled["weighted_ess_ratio"] == pytest.approx(first["weighted_ess_ratio"])
 
 
 def test_binary_dependence_uses_cross_fitted_logistic_score_residuals():
@@ -188,6 +299,67 @@ def test_dependence_diagnostics_preserve_variable_length_trajectories():
     assert result["trajectory_count"] == 3
     assert result["segment_count"] == 6
     assert 0.0 <= result["chi_hat"] <= 1.0
+
+
+def test_dependence_diagnostics_fail_closed_when_all_feedback_is_masked():
+    scores = [
+        np.asarray([[9.0], [9.0]], dtype=np.float64),
+        np.asarray([[-7.0], [-7.0], [-7.0]], dtype=np.float64),
+    ]
+    valid = [np.zeros(2, dtype=bool), np.zeros(3, dtype=bool)]
+    result = estimate_dependence_diagnostics(scores, valid_mask=valid, bootstrap_samples=8)
+    assert result["dependence_available"] is False
+    assert result["dependence_missing_reason"] == "no_valid_observations"
+    assert result["nominal_observations"] == 0
+    assert result["trajectory_count"] == 0
+    assert result["segment_count"] == 0
+    assert result["kappa_segment_by_m"] == {}
+    assert np.isfinite(result["kappa_segment"])
+    # Missing labels do not become observed zero scores or a fake m-grid.
+    assert result["effective_samples"] == 0.0
+
+
+def test_dependence_diagnostics_drops_fully_filtered_trajectories():
+    scores = [
+        np.asarray([[1.0], [2.0]], dtype=np.float64),
+        np.asarray([[100.0], [100.0], [100.0]], dtype=np.float64),
+        np.asarray([[3.0], [4.0], [5.0]], dtype=np.float64),
+    ]
+    valid = [
+        np.asarray([True, False]),
+        np.asarray([False, False, False]),
+        np.asarray([True, True, True]),
+    ]
+    # The second trajectory is entirely unavailable and must not count as a
+    # zero cluster in either the HAC estimate or the cluster bootstrap.
+    result = estimate_dependence_diagnostics(scores, valid_mask=valid, bootstrap_samples=8)
+    assert result["dependence_available"] is True
+    assert result["trajectory_count"] == 2
+    assert result["cluster_count"] == 2
+    assert result["segment_count"] == 4
+    assert result["nominal_observations"] == 4
+
+
+def test_internal_dependence_estimator_handles_ragged_empty_rows():
+    # History/bootstrap callers may pass ragged rows directly.  Empty rows
+    # are absent observations and must not create a synthetic m=0 lookup.
+    from verl.trainer.ppo.polyseg import _estimate_dependence_once
+
+    result = _estimate_dependence_once(
+        [np.zeros((0, 1)), np.asarray([[1.0], [2.0]])],
+        [np.zeros(0), np.ones(2)],
+        hac_lag=1,
+        ridge=1e-6,
+    )
+    assert result["kappa_segment"] >= 1.0
+    assert result["nominal_observations"] == 2
+    assert result["cluster_count"] == 1
+
+    missing = _estimate_dependence_once(
+        [np.zeros((0, 1))], [np.zeros(0)], hac_lag=1, ridge=1e-6
+    )
+    assert missing["dependence_available"] is False
+    assert missing["kappa_segment_by_m"] == {}
 
 
 def test_hac_uses_bartlett_window_at_truncated_lag():
@@ -317,6 +489,49 @@ def test_accumulating_ridge_state_matches_concatenated_fit_and_roundtrips():
 
 def test_accumulating_polyseg_advantage_reports_cumulative_samples():
     reset_polyseg_estimator_state()
+
+
+def test_persistent_oof_history_is_prequential_and_checkpointable():
+    """Past trajectories provide the next batch's OOF fold and round-trip."""
+    reset_polyseg_estimator_state()
+    kwargs = dict(
+        config={
+            "m": 2,
+            "q": 1,
+            "feature_dim": 1,
+            "ridge_lambda": 1.0,
+            "use_polynomial_critic": True,
+            "accumulate_estimator": True,
+            "estimator_state_id": "persistent-oof-test",
+            "dependence_history_limit": 4,
+            "normalize_advantages": False,
+        },
+        batch={
+            "segment_ids": torch.tensor([[0, 0, 1, 1]]),
+            "segment_features": torch.tensor([[[-1.0], [1.0]]]),
+        },
+    )
+    first = {}
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[0.0, 1.0]]), non_tensor_batch=first, **kwargs
+    )
+    assert first["polyseg_dependence_persistent_oof"].item() == 0.0
+    second = {}
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[1.0, 0.0]]), non_tensor_batch=second, **kwargs
+    )
+    assert second["polyseg_dependence_persistent_oof"].item() == 1.0
+    assert second["polyseg_dependence_diagnostic_oof"].item() == 1.0
+    assert second["polyseg_dependence_history_trajectories"].item() == 1.0
+    snapshot = polyseg_estimator_state_dict("persistent-oof-test")
+    assert len(snapshot["persistent-oof-test"]["dependence_history"]) == 2
+    load_polyseg_estimator_state_dict(snapshot, clear=True)
+    restored = polyseg_estimator_state_dict("persistent-oof-test")["persistent-oof-test"]
+    assert len(restored["dependence_history"]) == 2
+    assert restored["dependence_history_limit"] == 4
+    reset_polyseg_estimator_state()
     kwargs = dict(
         config={
             "m": 2,
@@ -345,6 +560,41 @@ def test_accumulating_polyseg_advantage_reports_cumulative_samples():
     )
     assert first["polyseg_estimator_sample_count"].item() == 2
     assert second["polyseg_estimator_sample_count"].item() == 4
+    reset_polyseg_estimator_state()
+
+
+def test_accumulating_estimator_rejects_feedback_semantic_reuse():
+    """A state bound to one feedback object cannot serve another protocol."""
+    reset_polyseg_estimator_state()
+    base = {
+        "m": 2,
+        "q": 1,
+        "feature_dim": 1,
+        "ridge_lambda": 1.0,
+        "use_polynomial_critic": True,
+        "accumulate_estimator": True,
+        "estimator_state_id": "feedback-semantic-state",
+        "normalize_advantages": False,
+    }
+    batch = {
+        "segment_ids": torch.tensor([[0, 0, 1, 1]]),
+        "segment_features": torch.tensor([[[-1.0], [1.0]]]),
+    }
+    compute_polyseg_advantage(
+        torch.zeros(1, 4),
+        torch.ones(1, 4, dtype=torch.bool),
+        config=base,
+        batch=batch,
+        segment_rewards=torch.tensor([[0.0, 1.0]]),
+    )
+    with pytest.raises(ValueError, match="already bound to a different PolySeg configuration"):
+        compute_polyseg_advantage(
+            torch.zeros(1, 4),
+            torch.ones(1, 4, dtype=torch.bool),
+            config={**base, "feedback": "terminal"},
+            batch=batch,
+            segment_rewards=torch.tensor([[0.0, 1.0]]),
+        )
     reset_polyseg_estimator_state()
 
 
@@ -614,6 +864,7 @@ def test_explicit_macro_transition_backup_exports_transition_diagnostics():
     assert torch.isfinite(advantages).all() and torch.isfinite(returns).all()
     assert non_tensor["polyseg_transition_feature_condition"].shape == (2,)
     assert non_tensor["polyseg_transition_feature_min_eigenvalue"].shape == (2,)
+    assert non_tensor["polyseg_transition_target_semantics"].tolist() == ["p_v_test_function"] * 2
 
 
 def test_single_turn_rollout_successor_metadata_drives_transition_backup():
@@ -709,6 +960,123 @@ def test_confidence_bonus_uses_pre_update_ridge_prior():
     # q=0 has phi(z)=[1].  With only the ridge prior, ||phi||_{I^-1}=1;
     # using the current two rows would incorrectly reduce it to sqrt(1/3).
     assert non_tensor["polyseg_confidence_bonus"].item() == pytest.approx(1.0, abs=1e-5)
+
+
+def test_confidence_bonus_uses_pre_update_dependence_radius_and_commits_after_batch():
+    reset_polyseg_dependence_state()
+    common = dict(
+        config={
+            "m": 2,
+            "q": 1,
+            "feature_dim": 1,
+            "ridge_lambda": 1.0,
+            "use_polynomial_critic": True,
+            "use_confidence_bonus": True,
+            "dependence_state_id": "pre-update-radius-test",
+            "normalize_advantages": False,
+            "r_max": 100.0,
+        },
+        batch={
+            "segment_ids": torch.tensor([[0, 0, 1, 1]]),
+            "segment_features": torch.tensor([[[-1.0], [1.0]]]),
+        },
+    )
+    first = {}
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[0.0, 1.0]]), non_tensor_batch=first, **common
+    )
+    assert first["polyseg_dependence_radius_multiplier_pre_update"].item() == pytest.approx(1.0)
+    assert first["polyseg_dependence_state_batches"].item() == pytest.approx(1.0)
+    saved_radius = first["polyseg_dependence_radius_multiplier_post_update"].item()
+    second = {}
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[1.0, 0.0]]), non_tensor_batch=second, **common
+    )
+    assert second["polyseg_dependence_radius_multiplier_pre_update"].item() == pytest.approx(saved_radius)
+    assert second["polyseg_dependence_state_batches"].item() == pytest.approx(2.0)
+    reset_polyseg_dependence_state()
+
+
+def test_current_labels_do_not_change_same_batch_online_confidence_bonus():
+    reset_polyseg_dependence_state()
+    common = dict(
+        config={
+            "m": 2,
+            "q": 1,
+            "feature_dim": 1,
+            "use_polynomial_critic": True,
+            "use_confidence_bonus": True,
+            "normalize_advantages": False,
+            "r_max": 100.0,
+        },
+        batch={
+            "segment_ids": torch.tensor([[0, 0, 1, 1]]),
+            "segment_features": torch.tensor([[[-1.0], [1.0]]]),
+        },
+    )
+    left, right = {}, {}
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[0.0, 0.0]]), non_tensor_batch=left, **common
+    )
+    reset_polyseg_dependence_state()
+    compute_polyseg_advantage(
+        torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+        segment_rewards=torch.tensor([[1.0, 1.0]]), non_tensor_batch=right, **common
+    )
+    assert left["polyseg_dependence_radius_multiplier_pre_update"].item() == pytest.approx(1.0)
+    assert right["polyseg_dependence_radius_multiplier_pre_update"].item() == pytest.approx(1.0)
+    assert left["polyseg_confidence_bonus"].item() == pytest.approx(
+        right["polyseg_confidence_bonus"].item(), abs=1e-6
+    )
+    reset_polyseg_dependence_state()
+
+
+def test_dependence_state_checkpoint_roundtrip_preserves_next_pre_update_radius():
+    reset_polyseg_dependence_state()
+    config = {
+        "m": 2, "q": 1, "feature_dim": 1, "use_polynomial_critic": True,
+        "use_confidence_bonus": True, "dependence_state_id": "checkpoint-radius-test",
+        "normalize_advantages": False, "r_max": 100.0,
+    }
+    batch = {"segment_ids": torch.tensor([[0, 0, 1, 1]]), "segment_features": torch.tensor([[[-1.0], [1.0]]])}
+    first = {}
+    compute_polyseg_advantage(torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool), config=config, batch=batch,
+                              segment_rewards=torch.tensor([[0.0, 1.0]]), non_tensor_batch=first)
+    snapshot = polyseg_dependence_state_dict("checkpoint-radius-test")
+    expected = snapshot["checkpoint-radius-test"]["dependence_radius_multiplier"]
+    reset_polyseg_dependence_state()
+    load_polyseg_dependence_state_dict(snapshot, clear=True)
+    second = {}
+    compute_polyseg_advantage(torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool), config=config, batch=batch,
+                              segment_rewards=torch.tensor([[1.0, 0.0]]), non_tensor_batch=second)
+    assert second["polyseg_dependence_radius_multiplier_pre_update"].item() == pytest.approx(expected)
+    assert second["polyseg_dependence_state_batches"].item() == pytest.approx(2.0)
+    reset_polyseg_dependence_state()
+
+
+def test_failed_batch_does_not_advance_dependence_state():
+    reset_polyseg_dependence_state()
+    config = {
+        "m": 2, "q": 1, "feature_dim": 1, "use_polynomial_critic": True,
+        "use_confidence_bonus": True, "dependence_state_id": "failed-radius-test",
+        "normalize_advantages": False, "r_max": 100.0, "bellman_closure_tolerance": 0.0,
+    }
+    batch = {"segment_ids": torch.tensor([[0, 0, 1, 1]]), "segment_features": torch.tensor([[[-1.0], [1.0]]])}
+    # An invalid feature shape fails before the commit hook and must not leave
+    # a partially updated history/radius in the process registry.
+    with pytest.raises(ValueError, match="segment_features"):
+        compute_polyseg_advantage(
+            torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool), config=config, batch=batch,
+            segment_rewards=torch.tensor([[0.0, 1.0]]),
+            segment_features=torch.zeros(1, 3, 1),
+        )
+    state = polyseg_dependence_state_dict("failed-radius-test")["failed-radius-test"]
+    assert state["dependence_diagnostic_batches"] == 0
+    assert state["dependence_history"] == []
+    reset_polyseg_dependence_state()
 
 
 def test_polynomial_critic_reconstructs_features_when_transport_drops_them():
@@ -1042,6 +1410,27 @@ def test_transition_estimator_macro_ratio_and_suffix_budget():
     assert budget.remaining == pytest.approx(0.0)
 
 
+def test_transition_estimator_fits_pv_directly_for_nonlinear_value():
+    """The Bellman target is E[V(X')|X,U], not V(E[X'|X,U])."""
+    z = torch.linspace(-1.0, 1.0, 12).repeat_interleave(8).unsqueeze(-1)
+    successor = torch.where(
+        torch.arange(z.shape[0]).remainder(2).eq(0).unsqueeze(-1),
+        torch.ones_like(z),
+        -torch.ones_like(z),
+    )
+    direct = PolynomialTransitionEstimator(q=2, feature_dim=1, ridge_lambda=1e-6)
+    direct.fit_test_function(z, successor, lambda value: value.square().squeeze(-1))
+    direct_pv = direct.predict_test_function(torch.tensor([[-0.7], [0.0], [0.8]]))
+    assert torch.allclose(direct_pv, torch.ones_like(direct_pv), atol=1e-3, rtol=1e-3)
+
+    vector = PolynomialTransitionEstimator(q=2, feature_dim=1, ridge_lambda=1e-6)
+    vector.fit(z, successor)
+    plug_in = vector.predict_next_features(torch.tensor([[-0.7], [0.0], [0.8]])).squeeze(-1).square()
+    # The conditional mean successor is approximately zero, so plugging it
+    # into the nonlinear value function produces a different estimand.
+    assert torch.all(plug_in < 1e-2)
+
+
 def test_reward_and_transition_confidence_bonuses_are_finite_and_nonnegative():
     features = legendre_features(torch.tensor([[-1.0], [0.0], [1.0]]), q=2)
     gram = features.T @ features + 0.1 * torch.eye(features.shape[-1])
@@ -1118,6 +1507,26 @@ def test_macro_policy_loss_accepts_launcher_m_segment_feedback(num_segments):
     )
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["segment/ratio_mean"])
+
+
+def test_macro_policy_loss_pads_short_ragged_feedback_mask_fail_closed():
+    """Missing ragged transport entries are excluded instead of crashing."""
+    old = torch.zeros(1, 6)
+    current = torch.full((1, 6), 0.01)
+    ids = torch.tensor([[0, 0, 1, 1, 2, 2]])
+    loss, metrics = compute_segment_policy_loss(
+        old_log_prob=old,
+        log_prob=current,
+        token_advantages=torch.ones(1, 6),
+        response_mask=torch.ones_like(ids, dtype=torch.bool),
+        segment_ids_tensor=ids,
+        # The third segment was observed in token metadata, but its feedback
+        # mask was dropped by a narrower ragged TransferQueue microbatch.
+        segment_feedback_mask=torch.tensor([[True, True]]),
+        num_segments=3,
+    )
+    assert torch.allclose(loss, -torch.exp(torch.tensor(0.02)))
+    assert metrics["segment/ratio_mean"].item() == pytest.approx(math.exp(0.02))
 
 
 def test_macro_bellman_backup_clips_action_values():
@@ -1269,3 +1678,97 @@ def test_kl_token_component_is_added_once_to_explicit_macro_reward():
         batch={"segment_rewards": segment_rewards, "segment_ids": segment_ids},
     )
     assert torch.allclose(returns, torch.tensor([[5.75, 5.75, 3.25, 3.25]]))
+
+
+def test_bound_and_selector_share_the_statistical_normalization():
+    common = dict(q=2, m=4, episodes=32, horizon=16, feature_dim=2, feedback="local_sum")
+    power = segment_feedback_bound(**common, selector_norm="power")
+    effective = segment_feedback_bound(**common, selector_norm="effective_round")
+    segment_update = segment_feedback_bound(**common, selector_norm="segment_update")
+    assert power["statistical_rounds"] == pytest.approx(32 * 4)
+    assert effective["statistical_rounds"] <= segment_update["statistical_rounds"]
+    assert power["segment"] == effective["segment"] == 0.0
+    assert effective["selector_norm"] == "effective_round"
+    # The selector itself must use the same rounds; a mismatch here was the
+    # original "reported bound != optimized objective" defect.
+    choice = choose_polynomial_segment_config(
+        q_candidates=[2], m_candidates=[4], episodes=32, horizon=16, budget=None,
+        feature_dim=2, feedback="local_sum", selector_norm="effective_round",
+    )
+    assert choice.statistical_term == pytest.approx(effective["statistical"], rel=1e-6)
+
+
+def test_q_diagnostics_expose_availability_and_prediction_stability():
+    features = torch.tensor(
+        [[[0.1, 0.2], [0.3, 0.4]], [[0.5, 0.1], [0.2, 0.9]]], dtype=torch.float32
+    )
+    rewards = torch.tensor([[1.0, 2.0], [0.5, 1.5]], dtype=torch.float32)
+    non_tensor = {}
+    compute_polyseg_advantage(
+        token_level_rewards=torch.zeros(2, 2),
+        response_mask=torch.ones(2, 2, dtype=torch.bool),
+        config={"m": 2, "q": 2, "feature_dim": 2, "use_polynomial_critic": True,
+                "normalize_advantages": False},
+        batch={"segment_rewards": rewards, "segment_features": features,
+               "segment_ids": torch.tensor([[0, 1], [0, 1]])},
+        non_tensor_batch=non_tensor,
+    )
+    assert "polyseg_prediction_q_stability" in non_tensor
+    assert float(non_tensor["polyseg_q_stability_available"][0]) == 1.0
+
+
+def test_unavailable_heldout_diagnostics_are_nan_not_zero():
+    features = torch.zeros(1, 2, 2)
+    rewards = torch.zeros(1, 2)
+    non_tensor = {}
+    compute_polyseg_advantage(
+        token_level_rewards=torch.zeros(1, 2),
+        response_mask=torch.ones(1, 2, dtype=torch.bool),
+        config={"m": 2, "q": 2, "feature_dim": 2, "use_polynomial_critic": True,
+                "normalize_advantages": False},
+        batch={"segment_rewards": rewards, "segment_features": features,
+               "segment_ids": torch.tensor([[0, 1]])},
+        non_tensor_batch=non_tensor,
+    )
+    assert float(non_tensor["polyseg_heldout_diagnostics_available"][0]) == 0.0
+    assert math.isnan(float(non_tensor["polyseg_heldout_return_residual_mse"][0]))
+
+
+def test_gae_does_not_bridge_across_a_masked_middle_segment():
+    rewards = torch.tensor([[1.0, 0.0, 2.0]])
+    mask = torch.tensor([[True, False, True]])
+    values = torch.tensor([[0.0, 100.0, 0.0]])
+    advantages, returns = compute_segment_gae_advantage(
+        rewards, values, segment_mask=mask, gamma=1.0, lam=1.0,
+    )
+    # Segment 0 must not use segment 2's value as successor through the hole.
+    assert advantages[0, 0].item() == pytest.approx(1.0)
+    assert returns[0, 1].item() == 0.0
+
+
+def test_polyseg_research_requires_rollout_segment_ids():
+    with pytest.raises(ValueError, match="rollout-owned segment_ids"):
+        compute_polyseg_advantage(
+            torch.zeros(1, 4), torch.ones(1, 4, dtype=torch.bool),
+            config={"m": 2, "q": 1, "feature_dim": 1, "use_polynomial_critic": True},
+            batch={"segment_rewards": torch.tensor([[1.0, 2.0]]),
+                   "segment_features": torch.zeros(1, 2, 1)},
+        )
+
+
+def test_weighted_logistic_fit_keeps_binary_labels():
+    z = torch.tensor([[-1.0], [-0.5], [0.5], [1.0]])
+    y = torch.tensor([0.0, 1.0, 0.0, 1.0])
+    weight = torch.tensor([10.0, 1.0, 1.0, 10.0])
+    critic = PolynomialSegmentCritic(q=1, feature_dim=1, feedback="binary", logistic_l2=1e-3)
+    critic.fit(z, y, sample_weight=weight)
+    assert torch.all((critic.targets == 0) | (critic.targets == 1))
+    assert torch.isfinite(critic.theta).all()
+
+
+def test_terminal_selector_cost_is_one_query_per_episode():
+    choice = choose_polynomial_segment_config(
+        q_candidates=[1], m_candidates=[8], episodes=4, horizon=8, budget=4,
+        feature_dim=1, feedback="terminal", segment_cost=1.0,
+    )
+    assert choice.m == 8 and choice.query_cost == 4.0

@@ -17,18 +17,22 @@ custom_reward_function:
 reward_kwargs:
   m: null
   feature_dim: null
-  feedback: sum
+  feedback: null
   budget: null
   # trajectory resets the ledger for each sample; global keeps B_K across
   # concurrent reward-loop calls and is used by full training runs.
   budget_scope: trajectory
-  segment_cost: 1.0
+  segment_cost: null
   # Shared JSON ledger used when global budgets span independent Ray workers.
   # Full-run launchers set this to an attempt-local path; leaving it null is
   # allowed only for a single in-process reward worker.
   feedback_ledger_path: null
   # error aborts on exhausted budget; skip records an explicit missing-feedback fallback.
   budget_fallback: error
+  # reserve_upper charges the reserved bound for every completed call; a lower
+  # reported cost is accepted only with a provider receipt under
+  # reported_with_receipt. Ambiguous failures are charged conservatively.
+  feedback_cost_policy: reserve_upper
   # Agentic runs must consume segment ids from AgentLoop. Set false only for
   # the legacy fixed-token smoke path.
   require_rollout_segments: false

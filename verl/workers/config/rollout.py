@@ -226,6 +226,21 @@ class RolloutConfig(BaseConfig):
     # Feature width used in the finite candidate feasibility check.
     polyseg_feature_dim: int = 4
 
+    # Optional serialized frozen representation for raw per-token hidden
+    # states supplied by the dataset/rollout caller. The content hash is
+    # checked before a trajectory is accepted.
+    polyseg_representation_path: Optional[str] = None
+    polyseg_representation_hash: str = ""
+
+    # Require a harness-owned recoverable boundary/hidden/kernel snapshot for
+    # event-boundary science traces.  The default keeps ordinary tool-agent
+    # rollouts usable while recording an explicit unavailable status.
+    polyseg_require_boundary_snapshots: bool = False
+
+    # Fully-qualified provider factory/object used by required tool-agent
+    # science runs to capture durable boundary artifacts.
+    polyseg_boundary_state_provider_path: Optional[str] = None
+
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     standalone_gpu_memory_utilization: Optional[float] = None

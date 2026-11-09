@@ -82,8 +82,13 @@ from verl.utils.debug.metrics import calculate_debug_metrics
 from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.polyseg_journal import (
+    configured_feedback_journal_path,
     configured_feedback_ledger_path,
+    restore_feedback_ledger_snapshot,
+    restore_feedback_journal_snapshot,
     snapshot_feedback_ledger,
+    snapshot_feedback_journal,
+    verify_feedback_journal_snapshot,
     verify_feedback_ledger_snapshot,
 )
 from verl.utils.py_functional import rename_dict
@@ -868,6 +873,7 @@ class PPOTrainer(ABC):
     def _load_checkpoint(self):
         self.global_steps = 0
         self._pending_polyseg_controller_state = None
+        self._pending_science_dual_state = None
 
         # A trainer instance owns the process-local fallback registry. Clear
         # it before either starting fresh or loading a checkpoint; otherwise a
@@ -878,10 +884,13 @@ class PPOTrainer(ABC):
         # mapping-style access so saving a regular checkpoint does not depend on
         # a PolySeg-specific config node being present.
         polyseg_config = self.config.get("algorithm", {}).get("polyseg", {})
-        if polyseg_config.get("accumulate_estimator", False):
-            from verl.trainer.ppo.polyseg import reset_polyseg_estimator_state
+        if polyseg_config.get("accumulate_estimator", False) or polyseg_config.get("use_confidence_bonus", False):
+            from verl.trainer.ppo.polyseg import reset_polyseg_estimator_state, reset_polyseg_dependence_state
 
-            reset_polyseg_estimator_state()
+            if polyseg_config.get("accumulate_estimator", False):
+                reset_polyseg_estimator_state()
+            if polyseg_config.get("use_confidence_bonus", False):
+                reset_polyseg_dependence_state()
 
         # 1. find latest checkpoint folder
         if self.config.trainer.resume_mode == "disable":
@@ -913,6 +922,10 @@ class PPOTrainer(ABC):
         if os.path.exists(controller_state_path):
             self._pending_polyseg_controller_state = torch.load(controller_state_path, weights_only=False)
             logger.info(f"Loaded pending PolySeg controller state from {controller_state_path}")
+        science_dual_state_path = os.path.join(global_step_folder, "science_dual_state.pt")
+        if os.path.exists(science_dual_state_path):
+            self._pending_science_dual_state = torch.load(science_dual_state_path, weights_only=False)
+            logger.info(f"Loaded pending PolySeg-Sci dual state from {science_dual_state_path}")
 
         # PolySeg's accumulating ridge estimator is trainer state in addition
         # to actor/critic weights. Restore it before processing the first
@@ -930,15 +943,57 @@ class PPOTrainer(ABC):
             else:
                 logger.warning(f"No PolySeg estimator state found at {polyseg_state_path}; starting estimator from scratch")
 
+        if polyseg_config.get("use_confidence_bonus", False):
+            polyseg_dependence_path = os.path.join(global_step_folder, "polyseg_dependence.pt")
+            if os.path.exists(polyseg_dependence_path):
+                from verl.trainer.ppo.polyseg import load_polyseg_dependence_state_dict
+
+                load_polyseg_dependence_state_dict(
+                    torch.load(polyseg_dependence_path, weights_only=False), clear=True
+                )
+                logger.info(f"Loaded PolySeg dependence/confidence state from {polyseg_dependence_path}")
+            else:
+                logger.warning(
+                    f"No PolySeg dependence state found at {polyseg_dependence_path}; "
+                    "starting confidence radius from its prior"
+                )
+
         ledger_path = configured_feedback_ledger_path(self.config)
+        journal_path = configured_feedback_journal_path(self.config)
+        journal_snapshot_path = os.path.join(global_step_folder, "polyseg_feedback_journal.json")
+        if journal_path is not None:
+            # A checkpoint without a journal cursor cannot be replayed safely:
+            # an interrupted process may have appended complete trajectories
+            # after this checkpoint and those rows would otherwise be charged
+            # twice when the dataloader resumes from the saved step.
+            if not os.path.isfile(journal_snapshot_path):
+                raise RuntimeError(
+                    "checkpoint is missing polyseg_feedback_journal.json while a shared feedback journal is configured"
+                )
+            verify_feedback_journal_snapshot(journal_path, journal_snapshot_path)
         ledger_snapshot_path = os.path.join(global_step_folder, "polyseg_feedback_ledger.json")
         if ledger_path is not None:
             if not os.path.exists(ledger_snapshot_path):
                 raise RuntimeError(
                     "checkpoint is missing polyseg_feedback_ledger.json while a shared feedback ledger is configured"
                 )
+
+        if journal_path is not None:
+            restored = restore_feedback_journal_snapshot(journal_path, journal_snapshot_path)
+            if restored["truncated_bytes"]:
+                logger.warning(
+                    "Removed %s post-checkpoint feedback-journal bytes before resume",
+                    restored["truncated_bytes"],
+                )
+
+        # A process may have settled feedback after the last checkpoint but
+        # before it was interrupted.  The journal cursor above removes those
+        # rows; restore the matching ledger snapshot before replaying the
+        # dataloader so the same feedback can be charged exactly once.
+        if ledger_path is not None:
+            restore_feedback_ledger_snapshot(ledger_path, ledger_snapshot_path)
             verify_feedback_ledger_snapshot(ledger_path, ledger_snapshot_path)
-            logger.info("Verified PolySeg feedback-ledger snapshot before resume")
+            logger.info("Restored and verified PolySeg feedback-ledger snapshot before resume")
 
         # 2. load actor checkpoint
         self.actor_rollout_wg.load_checkpoint(
@@ -974,17 +1029,23 @@ class PPOTrainer(ABC):
     def _restore_polyseg_controller_state(self) -> None:
         """Restore driver-side adaptive selector state after manager creation."""
         state = getattr(self, "_pending_polyseg_controller_state", None)
-        if state is None:
-            return
         manager = getattr(self, "agent_loop_manager", None)
-        controller = getattr(manager, "polyseg_controller", None)
-        if controller is None:
-            raise RuntimeError("checkpoint contains PolySeg controller state but adaptive manager is disabled")
-        from verl.trainer.ppo.polyseg import BudgetedPolySegController
+        if state is not None:
+            controller = getattr(manager, "polyseg_controller", None)
+            if controller is None:
+                raise RuntimeError("checkpoint contains PolySeg controller state but adaptive manager is disabled")
+            from verl.trainer.ppo.polyseg import BudgetedPolySegController
 
-        manager.polyseg_controller = BudgetedPolySegController.from_state_dict(state)
-        self._pending_polyseg_controller_state = None
-        logger.info("Restored PolySeg adaptive selector state")
+            manager.polyseg_controller = BudgetedPolySegController.from_state_dict(state)
+            self._pending_polyseg_controller_state = None
+            logger.info("Restored PolySeg adaptive selector state")
+        science_state = getattr(self, "_pending_science_dual_state", None)
+        if science_state is not None:
+            setter = getattr(manager, "set_science_dual_state", None)
+            if setter is None:
+                raise RuntimeError("checkpoint contains science dual state but manager cannot restore it")
+            setter(science_state)
+            self._pending_science_dual_state = None
 
     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
@@ -1087,10 +1148,22 @@ class PPOTrainer(ABC):
             torch.save(polyseg_estimator_state_dict(), polyseg_state_path)
             logger.info(f"Saved PolySeg estimator state to {polyseg_state_path}")
 
+        if polyseg_config.get("use_confidence_bonus", False):
+            from verl.trainer.ppo.polyseg import polyseg_dependence_state_dict
+
+            polyseg_dependence_path = os.path.join(local_global_step_folder, "polyseg_dependence.pt")
+            torch.save(polyseg_dependence_state_dict(), polyseg_dependence_path)
+            logger.info(f"Saved PolySeg dependence/confidence state to {polyseg_dependence_path}")
+
         controller = getattr(getattr(self, "agent_loop_manager", None), "polyseg_controller", None)
         if controller is not None:
             torch.save(controller.state_dict(), os.path.join(local_global_step_folder, "polyseg_controller.pt"))
             logger.info("Saved PolySeg adaptive selector state")
+        science_dual_state = getattr(getattr(self, "agent_loop_manager", None), "science_dual_state", None)
+        if science_dual_state is not None:
+            state_dict = science_dual_state.state_dict() if hasattr(science_dual_state, "state_dict") else science_dual_state
+            torch.save(state_dict, os.path.join(local_global_step_folder, "science_dual_state.pt"))
+            logger.info("Saved PolySeg-Sci constraint dual state")
 
         # The selector state is checkpointed by torch; the shared reward ledger
         # is a separate process-safe JSON file.  Store an exact snapshot beside
@@ -1104,6 +1177,22 @@ class PPOTrainer(ABC):
                 logger.info("Saved PolySeg feedback-ledger snapshot")
             except FileNotFoundError:
                 logger.warning("Configured PolySeg feedback ledger is missing; checkpoint is not ledger-resumable")
+
+        # Save a cursor for the append-only trajectory journal as part of the
+        # same checkpoint directory.  On resume, rows written after this
+        # checkpoint are truncated before the dataloader replays that batch;
+        # otherwise a clean interruption between periodic checkpoints would
+        # duplicate feedback cost and trajectory counts.
+        journal_path = configured_feedback_journal_path(self.config)
+        if journal_path is not None:
+            journal_snapshot_path = os.path.join(local_global_step_folder, "polyseg_feedback_journal.json")
+            try:
+                snapshot_feedback_journal(journal_path, journal_snapshot_path)
+                logger.info("Saved PolySeg feedback-journal checkpoint cursor")
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "configured PolySeg feedback journal is missing; refusing to create a non-resumable checkpoint"
+                ) from error
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1237,6 +1326,13 @@ class PPOTrainer(ABC):
                     reward_extra_info = (
                         extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
                     )
+                    # Persist rollout-owned tool/event traces in validation
+                    # JSONL.  Scalar reward extras alone cannot prove that a
+                    # tool interaction occurred or that m respected complete
+                    # event boundaries.
+                    if isinstance(extra_field, dict) and "agentic_trace" in extra_field:
+                        reward_extra_info = dict(reward_extra_info)
+                        reward_extra_info["agentic_trace"] = extra_field["agentic_trace"]
                     for key in reward_extra_infos_dict:
                         if key != "reward" and key not in reward_extra_info:
                             reward_extra_infos_dict[key].append(None)
@@ -1784,6 +1880,7 @@ class PPOTrainer(ABC):
             "segment_mask",
             "segment_feedback_mask",
             "segment_features",
+            "step_features",
             "segment_next_features",
             "segment_transition_mask",
         )
@@ -1803,13 +1900,21 @@ class PPOTrainer(ABC):
                             f"row {index} has {row.shape[0]} ids for {expected} response tokens"
                         )
                     length = expected
+                elif key == "step_features":
+                    expected = int(response_lengths[index].item())
+                    if row.shape[0] != expected:
+                        raise ValueError(
+                            "step_features must be response-token aligned in the v1 reward schema: "
+                            f"row {index} has {row.shape[0]} rows for {expected} response tokens"
+                        )
+                    length = expected
                 elif key == "segment_mask":
                     length = int(row.shape[0])
                 elif segment_masks is not None:
                     length = int(segment_masks[index].to(torch.bool).sum().item())
                 else:
                     length = int(row.shape[0])
-                if key in {"segment_features", "segment_next_features"}:
+                if key in {"segment_features", "step_features", "segment_next_features"}:
                     values.append(row[:length, :])
                 else:
                     values.append(row[:length])
@@ -1986,7 +2091,9 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob"]
+        if self.config.algorithm.adv_estimator != "polyseg_sci":
+            fields.append("values")
         if self.config.algorithm.adv_estimator in ("polyseg", "polyseg_gae"):
             fields.extend(
                 [
@@ -1996,6 +2103,9 @@ class PPOTrainer(ABC):
                     "segment_mask",
                     "segment_feedback_mask",
                     "segment_features",
+                    "step_features",
+                    "segment_next_features",
+                    "segment_transition_mask",
                     # Scalar reward accounting fields are transported with the
                     # batch so fixed-budget experiments can report their actual
                     # verifier cost instead of inferring it from m.
@@ -2013,16 +2123,43 @@ class PPOTrainer(ABC):
                     "extra_fields",
                 ]
             )
-            polyseg_runtime = self.config.algorithm.get("polyseg", {})
-            if polyseg_runtime.get("use_transition_estimator", False):
-                fields.extend(["segment_next_features", "segment_transition_mask"])
+        elif self.config.algorithm.adv_estimator == "polyseg_sci":
+            # Science batches carry only the explicit vector boundary contract;
+            # requesting scalar PolySeg fields here would make a valid science
+            # rollout look malformed in the TransferQueue.
+            fields.extend(
+                [
+                    "segment_ids",
+                    "segment_mask",
+                    "science_boundary_values",
+                    "science_boundary_mask",
+                    "science_endpoint_mask",
+                    "extra_fields",
+                ]
+            )
+            science_cfg = self.config.algorithm.get("polyseg", {}).get("science", {})
+            from verl.trainer.ppo.polyseg_sci import _science_objective_mode
+
+            science_mode = _science_objective_mode(self.config.algorithm) or "preference"
+            if science_mode == "pareto":
+                fields.append("science_pareto_alpha")
+            elif science_mode == "constraint":
+                fields.append("science_constraint_multipliers")
+                # Estimates are needed only by the explicitly enabled dual
+                # bootstrap compatibility path; production runs restore a
+                # persistent dual state and do not need this field.
+                allow_dual_bootstrap = science_cfg.get("allow_dual_bootstrap", False)
+                if not isinstance(allow_dual_bootstrap, bool):
+                    raise ValueError("science allow_dual_bootstrap must be boolean")
+                if allow_dual_bootstrap:
+                    fields.append("science_endpoint_estimates")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # In the async AgentLoop path reward extras are nested under
         # ``extra_fields.reward_extra_info``.  Extract scalar accounting before
         # converting the remaining TensorDict to padded tensors.
         polyseg_accounting: dict[str, list[float]] = defaultdict(list)
-        if self.config.algorithm.adv_estimator in ("polyseg", "polyseg_gae") and "extra_fields" in data:
+        if self.config.algorithm.adv_estimator in ("polyseg", "polyseg_gae", "polyseg_sci") and "extra_fields" in data:
             raw_extra_fields = data.pop("extra_fields")
             try:
                 extra_items = raw_extra_fields.tolist() if hasattr(raw_extra_fields, "tolist") else list(raw_extra_fields)
@@ -2108,6 +2245,22 @@ class PPOTrainer(ABC):
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
 
+        # Constraint-mode science updates consume the driver-owned projected
+        # dual state.  Reattach the current vector after TransferQueue
+        # retrieval so a stale or worker-local multiplier can never silently
+        # steer the actor.  The state is updated only by the audited science
+        # harness through AgentLoopManager.update_science_dual_state().
+        if self.config.algorithm.adv_estimator == "polyseg_sci":
+            from verl.trainer.ppo.polyseg_sci import _science_objective_mode
+
+            science_mode = _science_objective_mode(self.config.algorithm) or "preference"
+            if science_mode == "constraint":
+                science_state = getattr(self.agent_loop_manager, "science_dual_state", None)
+                if science_state is not None:
+                    data.batch["science_constraint_multipliers"] = science_state.multipliers.to(
+                        device=data.batch["response_mask"].device, dtype=torch.float32
+                    )
+
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)
         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
@@ -2168,7 +2321,10 @@ class PPOTrainer(ABC):
             for source_key, metric_key in (
                 ("polyseg_critic_mse", "polyseg/critic_mse"),
                 ("polyseg_bellman_residual_mse", "polyseg/bellman_residual_mse"),
+                ("polyseg_bellman_closure_residual", "polyseg/bellman_closure_residual"),
                 ("polyseg_confidence_bonus", "polyseg/confidence_bonus"),
+                ("polyseg_confidence_radius", "polyseg/confidence_radius"),
+                ("polyseg_confidence_delta", "polyseg/confidence_delta"),
                 ("polyseg_confidence_pre_update", "polyseg/confidence_pre_update"),
                 ("polyseg_feature_condition", "polyseg/feature_condition"),
                 ("polyseg_feature_min_eigenvalue", "polyseg/feature_min_eigenvalue"),
@@ -2189,6 +2345,11 @@ class PPOTrainer(ABC):
                 ("polyseg_kappa_segment_selected_upper", "polyseg/kappa_segment_selected_upper"),
                 ("polyseg_kappa_trajectory", "polyseg/kappa_trajectory"),
                 ("polyseg_kappa_trajectory_upper", "polyseg/kappa_trajectory_upper"),
+                ("polyseg_nominal_observations", "polyseg/nominal_observations"),
+                ("polyseg_dependence_cluster_count", "polyseg/dependence_cluster_count"),
+                ("polyseg_total_observation_weight", "polyseg/total_observation_weight"),
+                ("polyseg_weighted_ess_ratio", "polyseg/weighted_ess_ratio"),
+                ("polyseg_dependence_weighted_by_duration", "polyseg/dependence_weighted_by_duration"),
                 ("polyseg_effective_samples", "polyseg/dependence_effective_samples"),
                 ("polyseg_weighted_effective_samples", "polyseg/weighted_effective_samples"),
                 ("polyseg_iid_cluster_radius_ratio", "polyseg/iid_cluster_radius_ratio"),
@@ -2198,7 +2359,14 @@ class PPOTrainer(ABC):
                 ("polyseg_dependence_diagnostic_oof", "polyseg/dependence_diagnostic_oof"),
                 ("polyseg_dependence_residual_rms", "polyseg/dependence_residual_rms"),
                 ("polyseg_dependence_radius_multiplier", "polyseg/dependence_radius_multiplier"),
+                ("polyseg_dependence_radius_multiplier_pre_update", "polyseg/dependence_radius_multiplier_pre_update"),
+                ("polyseg_dependence_radius_multiplier_post_update", "polyseg/dependence_radius_multiplier_post_update"),
+                ("polyseg_confidence_radius_pre_update", "polyseg/confidence_radius_pre_update"),
+                ("polyseg_confidence_radius_post_update", "polyseg/confidence_radius_post_update"),
+                ("polyseg_dependence_state_batches", "polyseg/dependence_state_batches"),
                 ("polyseg_dependence_logistic_score", "polyseg/dependence_logistic_score"),
+                ("polyseg_dependence_persistent_oof", "polyseg/dependence_persistent_oof"),
+                ("polyseg_dependence_history_trajectories", "polyseg/dependence_history_trajectories"),
             ):
                 if source_key in data.non_tensor_batch:
                     metrics[metric_key] = float(np.asarray(data.non_tensor_batch[source_key], dtype=np.float32).mean())
@@ -2371,9 +2539,12 @@ class PPOTrainer(ABC):
             for row_index, (row_ids, row_mask) in enumerate(zip(ids, masks, strict=True)):
                 valid_ids = row_ids[row_mask & (row_ids >= 0)]
                 if feedback_masks is not None and valid_ids.numel():
-                    valid_ids = valid_ids[
-                        feedback_masks[row_index, valid_ids.clamp_min(0)]
-                    ]
+                    feedback = feedback_masks[row_index]
+                    in_range = valid_ids < feedback.shape[0]
+                    labels = torch.zeros_like(in_range)
+                    if torch.any(in_range):
+                        labels[in_range] = feedback[valid_ids[in_range]]
+                    valid_ids = valid_ids[labels]
                 global_macro_batch_size += int(torch.unique(valid_ids).numel())
         extra_info = {
             "calculate_entropy": calculate_entropy,

@@ -33,6 +33,7 @@ python -m verl.trainer.main_ppo \
   reward.custom_reward_function.name=compute_score \
   reward.reward_kwargs.m=${M} \
   reward.reward_kwargs.feedback=utility_delta \
+  reward.reward_kwargs.feedback_cost_policy=reported_with_receipt \
   reward.reward_kwargs.segment_cost=${SUFFIX_SAMPLES} \
   reward.reward_kwargs.require_rollout_segments=true \
   reward.reward_kwargs.budget=${BUDGET} \

@@ -108,3 +108,35 @@ async def test_agent_loop_tq_postprocess_skips_rollout_topk_on_validate(monkeypa
 
     assert "rollout_topk_ids" not in fields.keys()
     assert "rollout_topk_log_probs" not in fields.keys()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_tq_rejects_string_validate_before_scoring(monkeypatch):
+    worker = _DummyWorker(topk_log_probs=0)
+    output = _output({})
+    scored = False
+
+    async def score(*_args, **_kwargs):
+        nonlocal scored
+        scored = True
+
+    worker._compute_score = score
+    with pytest.raises(ValueError, match="validate must be boolean"):
+        await _WorkerTQ._agent_loop_postprocess(
+            worker, output, "false", uid="u0", session_id=0, global_steps=1,
+            raw_prompt=[{"role": "user", "content": "hi"}],
+        )
+    assert not scored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["false", 0, None])
+async def test_rollout_entry_rejects_invalid_validate_before_mutation(invalid):
+    batch = {"validate": invalid}
+    with pytest.raises(ValueError, match="validate must be boolean"):
+        await _WorkerTQ.generate_sequences(object(), batch)
+    assert batch == {"validate": invalid}
+    output = _output({})
+    with pytest.raises(ValueError, match="validate flag must be boolean"):
+        await AgentLoopWorker._agent_loop_postprocess(object(), output, invalid)
+    assert output.extra_fields == {}

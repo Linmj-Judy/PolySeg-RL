@@ -42,7 +42,17 @@ from tensordict import TensorDict
 
 from verl.trainer.ppo.v1 import trainer_base
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.polyseg import FileBackedSegmentRewardBudget
 from verl.utils import tensordict_utils as tu
+from verl.utils.polyseg_journal import (
+    append_feedback_record,
+    restore_feedback_journal_snapshot,
+    restore_feedback_ledger_snapshot,
+    snapshot_feedback_journal,
+    snapshot_feedback_ledger,
+    verify_feedback_journal_snapshot,
+    verify_feedback_ledger_snapshot,
+)
 
 
 @pytest.fixture(scope="module")
@@ -382,6 +392,226 @@ def test_save_load_then_reissue_only_inflight(tq_init, partition_id, tmp_path):
         submitted_uids = {uid for batch in stub.agent_loop_manager.batches for uid in batch["uid"]}
         assert submitted_uids == {pending}
         assert int(stub.agent_loop_manager.batches[0]["global_steps"]) == 5
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_checkpoint_resume_rolls_back_feedback_before_reissuing_pending_query(
+    tq_init, partition_id, tmp_path
+):
+    """Mirror the v1 resume order across real TQ, journal, and shared ledger.
+
+    A pending rollout may have written a billed feedback row after the last
+    model checkpoint.  Resume must first restore the journal/ledger prefix,
+    then load TQ and re-issue the pending prompt.  This prevents the replayed
+    query from being double-charged while preserving the durable prompt data.
+    """
+    pending = _uid()
+    journal = tmp_path / "feedback.jsonl"
+    ledger = tmp_path / "feedback.ledger.json"
+    journal_snapshot = tmp_path / "checkpoint" / "polyseg_feedback_journal.json"
+    ledger_snapshot = tmp_path / "checkpoint" / "polyseg_feedback_ledger.json"
+    tq_checkpoint = str(tmp_path / "checkpoint" / "transfer_queue")
+    budget = FileBackedSegmentRewardBudget(ledger, 4.0)
+    attempt_id = uuid.uuid4().hex
+
+    _submit_prompt(partition_id, pending, "pending", global_steps=4)
+    first = budget.reserve(1.0, reservation_id="checkpoint-query")
+    budget.commit(first, cost=1.0)
+    append_feedback_record(
+        journal,
+        attempt_id=attempt_id,
+        ledger_id=budget.ledger_id,
+        evaluation=False,
+        protocol="terminal",
+        query_cost=1.0,
+        query_count=1,
+        segment_count=1,
+        skipped_count=0,
+        budget_scope="training",
+        global_budget=budget,
+    )
+    pending_reservation = budget.reserve(1.0, reservation_id="pending-query")
+    assert budget.reserved == pytest.approx(1.0)
+    snapshot_feedback_journal(journal, journal_snapshot)
+    snapshot_feedback_ledger(ledger, ledger_snapshot)
+    tq.save_checkpoint(tq_checkpoint, metadata={"global_steps": 4})
+
+    # The external response arrives after the checkpoint.  The pending TQ
+    # prompt is intentionally retained and will be regenerated after the
+    # checkpoint state is restored.
+    budget.commit(pending_reservation, cost=1.0)
+    append_feedback_record(
+        journal,
+        attempt_id=attempt_id,
+        ledger_id=budget.ledger_id,
+        evaluation=False,
+        protocol="terminal",
+        query_cost=1.0,
+        query_count=1,
+        segment_count=1,
+        skipped_count=0,
+        budget_scope="training",
+        global_budget=budget,
+    )
+    assert budget.consumed == pytest.approx(2.0)
+
+    _clear_partition(partition_id)
+    tq.load_checkpoint(tq_checkpoint)
+    stub = _make_trainer_stub(global_steps=5)
+    try:
+        # This is the exact ordering used by PPOTrainer._load_checkpoint:
+        # validate the prefix, truncate post-checkpoint rows, restore the
+        # checkpoint ledger, verify it, then re-issue restored TQ prompts.
+        checked = verify_feedback_journal_snapshot(journal, journal_snapshot)
+        assert checked["trailing_bytes"] > 0
+        restore_feedback_journal_snapshot(journal, journal_snapshot)
+        restore_feedback_ledger_snapshot(ledger, ledger_snapshot)
+        restored_state = verify_feedback_ledger_snapshot(ledger, ledger_snapshot)
+        assert restored_state["consumed"] == pytest.approx(1.0)
+        assert restored_state["reserved"] == pytest.approx(1.0)
+
+        assert stub._reissue_inflight_prompts(partition_id) == 1
+        assert {uid for batch in stub.agent_loop_manager.batches for uid in batch["uid"]} == {pending}
+        # Replaying the same external query reuses its checkpointed hold; it
+        # does not reserve another unit of the global budget.
+        assert budget.reserve(1.0, reservation_id="pending-query") == pending_reservation
+        budget.commit(pending_reservation, cost=1.0)
+        append_feedback_record(
+            journal,
+            attempt_id=attempt_id,
+            ledger_id=budget.ledger_id,
+            evaluation=False,
+            protocol="terminal",
+            query_cost=1.0,
+            query_count=1,
+            segment_count=1,
+            skipped_count=0,
+            budget_scope="training",
+            global_budget=budget,
+        )
+        assert budget.reserved == pytest.approx(0.0)
+        assert budget.consumed == pytest.approx(2.0)
+        assert len(journal.read_bytes().splitlines()) == 2
+        assert _prompt_status(partition_id, pending) == "pending"
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_real_trainer_load_checkpoint_restores_feedback_and_transfer_queue(
+    tq_init, partition_id, tmp_path
+):
+    """Exercise the production ``PPOTrainer._load_checkpoint`` ordering on CPU."""
+    checkpoint = tmp_path / "global_step_4"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "actor").mkdir()
+    journal = tmp_path / "feedback.jsonl"
+    ledger = tmp_path / "feedback.ledger.json"
+    budget = FileBackedSegmentRewardBudget(ledger, 3.0)
+    attempt_id = uuid.uuid4().hex
+    pending = _uid()
+
+    _submit_prompt(partition_id, pending, "pending", global_steps=4)
+    settled = budget.reserve(1.0, reservation_id="settled-query")
+    budget.commit(settled, cost=1.0)
+    append_feedback_record(
+        journal,
+        attempt_id=attempt_id,
+        ledger_id=budget.ledger_id,
+        evaluation=False,
+        protocol="terminal",
+        query_cost=1.0,
+        query_count=1,
+        segment_count=1,
+        skipped_count=0,
+        budget_scope="training",
+        global_budget=budget,
+    )
+    pending_reservation = budget.reserve(1.0, reservation_id="pending-query")
+    snapshot_feedback_journal(journal, checkpoint / "polyseg_feedback_journal.json")
+    snapshot_feedback_ledger(ledger, checkpoint / "polyseg_feedback_ledger.json")
+    tq.save_checkpoint(str(checkpoint / "transfer_queue"), metadata={"global_steps": 4})
+    torch.save({"cursor": 4}, checkpoint / "data.pt")
+
+    # Simulate a response arriving after checkpoint creation.  The production
+    # loader must roll this back before restoring TQ and replaying the query.
+    budget.commit(pending_reservation, cost=1.0)
+    append_feedback_record(
+        journal,
+        attempt_id=attempt_id,
+        ledger_id=budget.ledger_id,
+        evaluation=False,
+        protocol="terminal",
+        query_cost=1.0,
+        query_count=1,
+        segment_count=1,
+        skipped_count=0,
+        budget_scope="training",
+        global_budget=budget,
+    )
+    _clear_partition(partition_id)
+
+    class FakeActor:
+        def __init__(self):
+            self.calls = []
+
+        def load_checkpoint(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class FakeLoader:
+        def __init__(self):
+            self.states = []
+
+        def load_state_dict(self, state):
+            self.states.append(state)
+
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "resume_mode": "resume_path",
+                "resume_from_path": str(checkpoint),
+                "del_local_ckpt_after_load": False,
+            },
+            "algorithm": {"polyseg": {"accumulate_estimator": False, "use_confidence_bonus": False}},
+            "reward": {
+                "reward_kwargs": {
+                    "feedback_journal_path": str(journal),
+                    "feedback_ledger_path": str(ledger),
+                }
+            },
+        }
+    )
+    stub = type("TrainerStub", (), {})()
+    stub.config = config
+    stub.trainer_mode = "separate_async"
+    stub.use_critic = False
+    stub.actor_rollout_wg = FakeActor()
+    stub.train_dataloader = FakeLoader()
+    stub._restored_tq_prompt_count = 0
+    stub._pending_polyseg_controller_state = None
+    stub._pending_science_dual_state = None
+    stub._load_checkpoint = PPOTrainer._load_checkpoint.__get__(stub)
+    stub._load_checkpoint()
+
+    try:
+        assert stub.global_steps == 4
+        # Production uses the fixed ``train`` partition for this counter. The
+        # test deliberately uses an isolated partition so it cannot touch the
+        # live research job's queue; the restored data is checked directly in
+        # that isolated partition below.
+        assert stub._restored_tq_prompt_count == 0
+        assert trainer_base._count_tq_prompt_groups(partition_id) == 1
+        assert len(stub.actor_rollout_wg.calls) == 1
+        assert stub.train_dataloader.states == [{"cursor": 4}]
+        assert budget.consumed == pytest.approx(1.0)
+        assert budget.reserved == pytest.approx(1.0)
+        assert len(journal.read_bytes().splitlines()) == 1
+        # The restored prompt can flow directly into the production reissue
+        # method after the agent-loop manager is initialized by fit().
+        stub.agent_loop_manager = FakeAgentLoopManager()
+        stub._reissue_inflight_prompts = PPOTrainer._reissue_inflight_prompts.__get__(stub)
+        assert stub._reissue_inflight_prompts(partition_id) == 1
+        assert list(stub.agent_loop_manager.batches[0]["uid"]) == [pending]
     finally:
         _clear_partition(partition_id)
 

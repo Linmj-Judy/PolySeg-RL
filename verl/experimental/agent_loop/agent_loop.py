@@ -32,6 +32,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -46,9 +47,22 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.protocol import DataProto
+from verl.experimental.agent_loop.boundary_state import load_boundary_state_provider
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
-from verl.trainer.ppo.polyseg import BudgetedPolySegController, PolySegConfig
+from verl.trainer.ppo.polyseg import (
+    BudgetedPolySegController,
+    FrozenLowDimRepresentation,
+    PolySegConfig,
+    load_frozen_representation,
+    resolve_polyseg_option,
+)
+from verl.trainer.ppo.polyseg_sci import ConstraintDualState, _science_objective_mode, load_endpoint_schema
+from verl.trainer.ppo.polyseg_sci_provider import (
+    ScienceRoundRequest,
+    attach_science_response,
+    load_science_round_provider,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.import_utils import resolve_config_path
@@ -86,9 +100,30 @@ POLYSEG_METADATA_DTYPES = {
     "segment_mask": torch.long,
     "segment_feedback_mask": torch.long,
     "segment_features": torch.float32,
+    # Optional rollout-provided frozen per-step representation used by the
+    # shared-step reward route.  It is ragged along the token axis.
+    "step_features": torch.float32,
     "segment_next_features": torch.float32,
     "segment_transition_mask": torch.long,
+    # Explicit token-level observation masks are rollout-owned.  The segment
+    # action-mask lists remain ragged and are preserved in extra_fields.
+    "tool_observation_mask": torch.bool,
 }
+
+# PolySeg-Sci keeps vector endpoint values and objective state on the rollout
+# side.  These fields are intentionally separate from scalar reward metadata:
+# the science estimator must fail closed when an endpoint or its mask is lost
+# while crossing the AgentLoop/TransferQueue boundary.
+POLYSEG_SCI_METADATA_DTYPES = {
+    "science_boundary_values": torch.float32,
+    "science_boundary_mask": torch.bool,
+    "science_endpoint_mask": torch.bool,
+    "science_pareto_alpha": torch.float32,
+    "science_constraint_multipliers": torch.float32,
+    "science_endpoint_estimates": torch.float32,
+}
+
+ROLLOUT_METADATA_DTYPES = {**POLYSEG_METADATA_DTYPES, **POLYSEG_SCI_METADATA_DTYPES}
 
 
 def _polyseg_metadata_value(extra_fields: dict[str, Any], key: str):
@@ -207,7 +242,7 @@ class AgentLoopOutput(BaseModel):
             # Keeping the original nested copy in ``extra_fields`` preserves
             # compatibility with validation/logging consumers.
             if isinstance(reward_extra_info, dict):
-                for key, dtype in POLYSEG_METADATA_DTYPES.items():
+                for key, dtype in ROLLOUT_METADATA_DTYPES.items():
                     value = _polyseg_metadata_value(self.extra_fields, key)
                     if value is None:
                         continue
@@ -219,11 +254,24 @@ class AgentLoopOutput(BaseModel):
 
         # Promote direct rollout metadata too, including asynchronous reward
         # results that are not present when the output object is first built.
-        for key, dtype in POLYSEG_METADATA_DTYPES.items():
+        for key, dtype in ROLLOUT_METADATA_DTYPES.items():
             value = _polyseg_metadata_value(self.extra_fields, key)
             if value is None:
                 continue
             value = np.array(value, copy=True) if isinstance(value, np.ndarray) else value
+            if key == "step_features":
+                step_tensor = torch.as_tensor(value, dtype=dtype)
+                if step_tensor.ndim != 2 or step_tensor.shape[0] != output["responses"].numel():
+                    raise ValueError(
+                        "rollout step_features must be [response_tokens, feature_dim] and "
+                        "token-aligned with responses"
+                    )
+            if key == "tool_observation_mask":
+                observation_tensor = torch.as_tensor(value, dtype=dtype).reshape(-1)
+                if observation_tensor.numel() != output["responses"].numel():
+                    raise ValueError(
+                        "rollout tool_observation_mask must be token-aligned with responses"
+                    )
             output[key] = torch.as_tensor(value, dtype=dtype)
 
         # Mutating a default dict does not add the field to Pydantic's fields-set,
@@ -349,6 +397,11 @@ class AgentLoopBase(ABC):
             processor=self.processor,
         )
         self.loop = get_event_loop()
+        # A representation is immutable for the lifetime of a rollout worker.
+        # Cache it after the first request so every trajectory uses the exact
+        # same normalization/projection and fingerprint.
+        self._polyseg_representation_cache: FrozenLowDimRepresentation | None = None
+        self._polyseg_representation_cache_path: str | None = None
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
         """Fail loudly when multimodal inputs are present but unsupported.
@@ -567,6 +620,127 @@ class AgentLoopBase(ABC):
             return prompt_ids[-prompt_length:]
         return prompt_ids
 
+    def _load_polyseg_representation(self) -> FrozenLowDimRepresentation | None:
+        """Load and validate the rollout-side frozen PolySeg representation.
+
+        Hidden states are only a valid fixed feature map when the checkpoint is
+        explicit and its content hash matches the configured value.  An
+        already mapped ``feature_dim`` vector can be supplied without a file;
+        in that case it is treated as an externally frozen representation.
+        """
+
+        path = getattr(self.rollout_config, "polyseg_representation_path", None)
+        configured_hash = str(getattr(self.rollout_config, "polyseg_representation_hash", "") or "")
+        if path is None or str(path).strip() == "":
+            if configured_hash:
+                raise ValueError(
+                    "polyseg_representation_hash is set but polyseg_representation_path is empty"
+                )
+            return None
+        path = os.path.expanduser(str(path))
+        if self._polyseg_representation_cache is None or self._polyseg_representation_cache_path != path:
+            representation = load_frozen_representation(path)
+            if configured_hash and representation.fingerprint != configured_hash:
+                raise ValueError(
+                    "frozen PolySeg representation hash does not match "
+                    "rollout.polyseg_representation_hash"
+                )
+            self._polyseg_representation_cache = representation
+            self._polyseg_representation_cache_path = path
+        elif configured_hash and self._polyseg_representation_cache.fingerprint != configured_hash:
+            raise ValueError("cached PolySeg representation hash does not match configured hash")
+        return self._polyseg_representation_cache
+
+    def _prepare_polyseg_step_features(
+        self, kwargs: dict[str, Any], response_length: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, FrozenLowDimRepresentation | None, str | None]:
+        """Validate external per-token state features for a rollout.
+
+        Returns mapped features, the state matrix to use for segment pooling,
+        the frozen representation (if raw hidden states were supplied), and
+        its fingerprint.  The aliases keep dataset integrations compatible
+        while the canonical transport field remains ``step_features``.
+        """
+
+        value = None
+        source_key = None
+        sources = [kwargs]
+        nested_extra = kwargs.get("extra_info")
+        if isinstance(nested_extra, Mapping):
+            sources.append(nested_extra)
+        for key in ("polyseg_step_features", "step_features", "polyseg_hidden_states", "hidden_states"):
+            for source in sources:
+                if key in source and source[key] is not None:
+                    value = source[key]
+                    source_key = key
+                    break
+            if value is not None:
+                break
+        configured_representation = self._load_polyseg_representation()
+        if value is None:
+            if configured_representation is not None:
+                raise ValueError(
+                    "rollout PolySeg frozen representation is configured, but no per-token "
+                    "step_features/hidden_states were supplied"
+                )
+            return None, None, None, None
+        if response_length < 1:
+            raise ValueError("PolySeg step features cannot be attached to an empty response")
+        try:
+            raw = torch.as_tensor(value, dtype=torch.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{source_key} must be a finite numeric feature matrix") from exc
+        if raw.ndim == 3 and raw.shape[0] == 1:
+            raw = raw.squeeze(0)
+        if raw.ndim == 1:
+            raw = raw.unsqueeze(-1)
+        if raw.ndim != 2 or raw.shape[0] < response_length or raw.shape[1] < 1:
+            raise ValueError(
+                f"{source_key} must have shape [response_tokens, feature_dim] with at least "
+                f"{response_length} rows; got {tuple(raw.shape)}"
+            )
+        raw = raw[:response_length].contiguous()
+        if not torch.isfinite(raw).all():
+            raise ValueError(f"{source_key} contains non-finite values")
+        representation = configured_representation
+        expected_dim = max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4)))
+        if representation is None:
+            if raw.shape[1] != expected_dim:
+                raise ValueError(
+                    f"{source_key} has width {raw.shape[1]}, but rollout.polyseg_feature_dim="
+                    f"{expected_dim}; configure a frozen representation for raw hidden states"
+                )
+            if torch.any(raw < -1.0) or torch.any(raw > 1.0):
+                raise ValueError(
+                    f"{source_key} must already be normalized to [-1, 1] when no frozen "
+                    "representation checkpoint is configured"
+                )
+            mapped = raw
+            state = mapped
+            fingerprint = None
+        else:
+            if raw.shape[1] != representation.input_dim:
+                raise ValueError(
+                    f"{source_key} width {raw.shape[1]} does not match frozen representation "
+                    f"input_dim={representation.input_dim}"
+                )
+            mapped = representation.transform(raw)
+            if mapped.shape[1] != expected_dim:
+                raise ValueError(
+                    "frozen representation output dimension does not match "
+                    "rollout.polyseg_feature_dim"
+                )
+            state = raw
+            fingerprint = representation.fingerprint
+        requested_hash = kwargs.get("polyseg_representation_hash")
+        if requested_hash is None and isinstance(nested_extra, Mapping):
+            requested_hash = nested_extra.get("polyseg_representation_hash")
+        if requested_hash is not None:
+            requested_hash = str(requested_hash.item() if hasattr(requested_hash, "item") else requested_hash)
+            if not fingerprint or requested_hash != fingerprint:
+                raise ValueError("per-sample PolySeg representation hash failed closed validation")
+        return mapped, state, representation, fingerprint
+
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         """Run agent loop to interact with LLM server and environment.
@@ -621,6 +795,16 @@ class AgentLoopWorker:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+
+        # PolySeg-Sci must run on both the ordinary colocated AgentLoop path
+        # and the TransferQueue adapter.  Keep the provider explicit and
+        # fail closed when science is enabled without a configured harness;
+        # disabled scalar PolySeg runs still take the zero-cost ``None`` path.
+        self.science_round_provider = load_science_round_provider(config)
+        # Boundary snapshots are worker-owned runtime artifacts. Keep the
+        # provider handle out of dataset metadata and inject it into each
+        # tool-agent loop instance alongside the science provider seam.
+        self.boundary_state_provider = load_boundary_state_provider(config)
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
@@ -709,6 +893,8 @@ class AgentLoopWorker:
         """
         config = self.rollout_config
         validate = batch.meta_info.get("validate", False)
+        if not isinstance(validate, bool):
+            raise ValueError("rollout validate flag must be boolean")
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
@@ -812,6 +998,12 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
+                # Some lightweight unit-test workers are constructed with
+                # ``object.__new__`` and predate the worker-owned provider
+                # attribute.  Preserve the disabled/optional path there;
+                # required snapshot runs still fail closed during normal
+                # worker construction and ToolAgentLoop capture.
+                boundary_state_provider=getattr(self, "boundary_state_provider", None),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
@@ -847,9 +1039,51 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
+    async def _apply_science_round(self, outputs: list[AgentLoopOutput], *, validate: bool, kwargs: dict[str, Any]) -> None:
+        """Run the configured PolySeg-Sci provider for the ordinary worker path.
+
+        The TransferQueue worker has a parallel implementation because it
+        persists outputs asynchronously.  Keeping the provider call here as
+        a small shared seam makes the colocated/legacy path obey the same
+        endpoint-vector and fail-closed contract without putting evaluator or
+        restore side effects into advantage computation.
+        """
+
+        if not isinstance(validate, bool):
+            raise ValueError("science rollout validate flag must be boolean")
+        if getattr(self, "science_round_provider", None) is None:
+            return
+        # Validation batches do not participate in the training advantage
+        # update.  A real OpenAI4S provider intentionally refuses validation
+        # rounds because they would spend training-audit budget without a
+        # frozen-policy correction record; keep that policy consistent on the
+        # ordinary colocated path.
+        if validate:
+            return
+        if not outputs:
+            raise ValueError("PolySeg-Sci requires at least one AgentLoop output")
+        request = ScienceRoundRequest(
+            output=outputs[-1],
+            outputs=tuple(outputs),
+            validate=validate,
+            context={**kwargs, "validate": validate},
+        )
+        response = await self.science_round_provider.execute(request)
+        attach_science_response(outputs, response)
+
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        if not isinstance(validate, bool):
+            raise ValueError("rollout validate flag must be boolean")
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        # Driver-owned science objective state must survive both the colocated
+        # reward path and the asynchronous TransferQueue path.  Agent-loop
+        # implementations are free to ignore unknown kwargs, so copy only the
+        # registered vector contract into the durable extra-field envelope.
+        for key in POLYSEG_SCI_METADATA_DTYPES:
+            if key in kwargs and key not in output.extra_fields:
+                value = kwargs[key]
+                output.extra_fields[key] = value.tolist() if isinstance(value, np.ndarray) else value
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -941,7 +1175,10 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
-        await self._compute_score([output], kwargs={**kwargs, "validate": bool(validate)})
+        await self._compute_score([output], kwargs={**kwargs, "validate": validate})
+        apply_science_round = getattr(self, "_apply_science_round", None)
+        if apply_science_round is not None:
+            await apply_science_round([output], validate=validate, kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -1226,6 +1463,93 @@ class AgentLoopWorker:
         elif raw_segment_ids:
             optional_outputs["segment_ids"] = torch.stack(raw_segment_ids, dim=0)
 
+        # Per-token frozen features are ragged in the response axis.  Pad only
+        # the right edge to the rollout response width; the actor/reward path
+        # uses response_mask and segment_ids to exclude those rows.  Mixed
+        # presence would make shared-step recovery silently drop trajectories,
+        # so reject it at the transport boundary.
+        raw_step_features = [_polyseg_metadata_value(item.extra_fields, "step_features") for item in inputs]
+        if raw_step_features and any(value is not None for value in raw_step_features):
+            if any(value is None for value in raw_step_features):
+                raise ValueError("step_features must be present for every rollout in a shared-step batch")
+            feature_tensors = []
+            feature_dim = None
+            for value in raw_step_features:
+                tensor = torch.as_tensor(value, dtype=torch.float32)
+                if tensor.ndim == 3 and tensor.shape[0] == 1:
+                    tensor = tensor.squeeze(0)
+                if tensor.ndim != 2:
+                    raise ValueError("step_features must be [response_tokens, feature_dim]")
+                if tensor.shape[0] > response_mask.shape[1] or tensor.shape[1] < 1:
+                    raise ValueError("step_features exceed the padded response width or have an empty feature axis")
+                if not torch.isfinite(tensor).all():
+                    raise ValueError("step_features must contain finite values")
+                if feature_dim is None:
+                    feature_dim = int(tensor.shape[1])
+                elif int(tensor.shape[1]) != feature_dim:
+                    raise ValueError("step_features feature dimensions must agree across the rollout batch")
+                padded = torch.zeros((response_mask.shape[1], feature_dim), dtype=torch.float32)
+                padded[: tensor.shape[0]] = tensor
+                feature_tensors.append(padded)
+            optional_outputs["step_features"] = torch.stack(feature_tensors, dim=0)
+
+        # Science vectors use a macro axis that is naturally ragged when
+        # causal trajectories terminate at different lengths.  Pad only that
+        # structural axis and carry explicit masks; padded values repeat the
+        # last observed boundary solely to keep the tensor finite and are
+        # excluded by ``science_boundary_mask``/``science_endpoint_mask``.
+        raw_values = [_polyseg_metadata_value(item.extra_fields, "science_boundary_values") for item in inputs]
+        if raw_values and any(value is not None for value in raw_values):
+            if any(value is None for value in raw_values):
+                raise ValueError("science_boundary_values must be present for every rollout in the batch")
+            value_tensors = [torch.as_tensor(value, dtype=torch.float32) for value in raw_values]
+            if any(tensor.ndim != 2 or tensor.shape[0] < 2 for tensor in value_tensors):
+                raise ValueError("science_boundary_values must be [segments+1, endpoints]")
+            endpoint_dim = value_tensors[0].shape[1]
+            if any(tensor.shape[1] != endpoint_dim or not torch.isfinite(tensor).all() for tensor in value_tensors):
+                raise ValueError("science boundary endpoint vectors must be finite and aligned")
+            max_boundaries = max(tensor.shape[0] for tensor in value_tensors)
+            padded_values = []
+            padded_segment_masks = []
+            padded_endpoint_masks = []
+            for item, tensor in zip(inputs, value_tensors, strict=True):
+                segments = tensor.shape[0] - 1
+                boundary_mask_value = _polyseg_metadata_value(item.extra_fields, "science_boundary_mask")
+                segment_mask = torch.ones(segments, dtype=torch.bool) if boundary_mask_value is None else torch.as_tensor(
+                    boundary_mask_value, dtype=torch.bool
+                ).reshape(-1)
+                if segment_mask.numel() != segments:
+                    raise ValueError("science_boundary_mask must match the segment axis")
+                endpoint_mask_value = _polyseg_metadata_value(item.extra_fields, "science_endpoint_mask")
+                endpoint_mask = torch.ones_like(tensor, dtype=torch.bool) if endpoint_mask_value is None else torch.as_tensor(
+                    endpoint_mask_value, dtype=torch.bool
+                )
+                if endpoint_mask.shape != tensor.shape:
+                    raise ValueError("science_endpoint_mask must match boundary values")
+                pad_rows = max_boundaries - tensor.shape[0]
+                if pad_rows:
+                    tensor = torch.cat((tensor, tensor[-1:].expand(pad_rows, -1)), dim=0)
+                    endpoint_mask = torch.cat(
+                        (endpoint_mask, torch.zeros(pad_rows, endpoint_dim, dtype=torch.bool)), dim=0
+                    )
+                    segment_mask = torch.cat((segment_mask, torch.zeros(pad_rows, dtype=torch.bool)), dim=0)
+                padded_values.append(tensor)
+                padded_endpoint_masks.append(endpoint_mask)
+                padded_segment_masks.append(segment_mask)
+            optional_outputs["science_boundary_values"] = torch.stack(padded_values, dim=0)
+            optional_outputs["science_boundary_mask"] = torch.stack(padded_segment_masks, dim=0)
+            optional_outputs["science_endpoint_mask"] = torch.stack(padded_endpoint_masks, dim=0)
+
+        for key, dtype in POLYSEG_SCI_METADATA_DTYPES.items():
+            if key in {"science_boundary_values", "science_boundary_mask", "science_endpoint_mask"}:
+                continue
+            raw_values = [_polyseg_metadata_value(item.extra_fields, key) for item in inputs]
+            if not raw_values or any(value is None for value in raw_values):
+                continue
+            tensors = [torch.as_tensor(value, dtype=dtype) for value in raw_values]
+            if all(tensor.shape == tensors[0].shape for tensor in tensors[1:]):
+                optional_outputs[key] = torch.stack(tensors, dim=0)
+
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1291,7 +1615,7 @@ class AgentLoopWorker:
         reward_extra_keys = sorted({key for info in reward_extra_infos if isinstance(info, dict) for key in info})
         for key in reward_extra_keys:
             values = [info.get(key) if isinstance(info, dict) else None for info in reward_extra_infos]
-            if key in POLYSEG_METADATA_DTYPES:
+            if key in ROLLOUT_METADATA_DTYPES:
                 value_array = np.empty(len(values), dtype=object)
                 value_array[:] = [np.array(value, copy=True) if isinstance(value, np.ndarray) else value for value in values]
                 non_tensor_batch[key] = value_array
@@ -1382,11 +1706,22 @@ class AgentLoopManager:
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
+        # PolySeg-Sci constraint multipliers live on the driver alongside the
+        # adaptive selector.  Rollout workers only receive serialized values;
+        # they must never create worker-local dual states because that would
+        # make the primal/dual update depend on worker count and scheduling.
+        self.science_endpoint_schema = None
+        self.science_dual_state: ConstraintDualState | None = None
+        self._initialize_science_dual_state(config)
+
         # The adaptive selector is deliberately driver-side. Rollout workers
         # process chunks independently, so a worker-local ledger would multiply
         # the configured feedback budget by the worker count.
         self.polyseg_controller: BudgetedPolySegController | None = None
-        if bool(getattr(self.rollout_config, "polyseg_adaptive", False)):
+        adaptive = resolve_polyseg_option(config, "adaptive", default=False)
+        if not isinstance(adaptive, bool):
+            raise ValueError("PolySeg adaptive flag must be boolean")
+        if adaptive:
             selector_config = PolySegConfig.from_any(getattr(config, "algorithm", None))
             # Algorithm config is canonical; rollout aliases are accepted for
             # launcher-only overrides when the nested algorithm value keeps
@@ -1400,12 +1735,24 @@ class AgentLoopManager:
             if compute_budget is None and rollout_compute_budget is not None:
                 compute_budget = float(rollout_compute_budget)
             self.polyseg_controller = BudgetedPolySegController(
-                q_candidates=getattr(self.rollout_config, "polyseg_q_candidates", [0, 1, 2, 4]),
-                m_candidates=getattr(self.rollout_config, "polyseg_m_candidates", [1, 2, 4, 8]),
-                total_budget=getattr(self.rollout_config, "polyseg_total_budget", None),
-                segment_cost=float(getattr(self.rollout_config, "polyseg_segment_cost", 1.0)),
-                selector_norm=str(getattr(self.rollout_config, "polyseg_selector_norm", "effective_round")),
-                budget_fallback=str(getattr(self.rollout_config, "polyseg_budget_fallback", "error")),
+                q_candidates=resolve_polyseg_option(
+                    config, "q_candidates", default=[0, 1, 2, 4]
+                ),
+                m_candidates=resolve_polyseg_option(
+                    config, "m_candidates", default=[1, 2, 4, 8]
+                ),
+                total_budget=resolve_polyseg_option(
+                    config, "budget", rollout_alias="polyseg_total_budget", default=None
+                ),
+                segment_cost=float(
+                    resolve_polyseg_option(config, "segment_cost", default=1.0)
+                ),
+                selector_norm=str(
+                    resolve_polyseg_option(config, "selector_norm", rollout_alias="polyseg_selector_norm", default="effective_round")
+                ),
+                budget_fallback=str(
+                    resolve_polyseg_option(config, "budget_fallback", default="error")
+                ),
                 dependence_chi=selector_config.dependence_chi,
                 stat_exponent_u=selector_config.stat_exponent_u,
                 approx_exponent_v=selector_config.approx_exponent_v,
@@ -1422,6 +1769,115 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
+    @staticmethod
+    def _config_value(source: Any, name: str, default: Any = None) -> Any:
+        """Read a value from OmegaConf, a mapping, or a dataclass config."""
+
+        if source is None:
+            return default
+        try:
+            value = source.get(name, default)
+        except (AttributeError, TypeError):
+            value = getattr(source, name, default)
+        # OmegaConf's ``None`` is a real missing value for this contract; do
+        # not turn it into the string ``"None"`` while resolving paths.
+        return default if value is None and default is not None else value
+
+    def _science_config(self, config: Any) -> Any:
+        algorithm = self._config_value(config, "algorithm", None)
+        return self._config_value(self._config_value(algorithm, "polyseg", None), "science", None)
+
+    def _initialize_science_dual_state(self, config: Any) -> None:
+        """Create the persistent dual state for an enabled constraint run.
+
+        A constraint update has no meaningful dimension without the
+        pre-registered endpoint schema.  Therefore a constraint science run
+        with no schema path fails during manager construction rather than
+        silently falling back to a per-batch penalty.
+        """
+
+        science = self._science_config(config)
+        algorithm = self._config_value(config, "algorithm", None)
+        adv_estimator = self._config_value(algorithm, "adv_estimator", None)
+        enabled = self._config_value(science, "enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("PolySeg-Sci enabled flag must be boolean")
+        mode = _science_objective_mode(config) or "preference"
+        if not ((enabled or adv_estimator == "polyseg_sci") and mode == "constraint"):
+            return
+
+        schema_path = self._config_value(science, "endpoint_schema_path", "")
+        if not schema_path:
+            raise ValueError("PolySeg-Sci constraint mode requires endpoint_schema_path")
+        schema = load_endpoint_schema(schema_path)
+        configured_hash = self._config_value(science, "endpoint_schema_hash", "")
+        if configured_hash and str(configured_hash) != schema.fingerprint:
+            raise ValueError("PolySeg-Sci endpoint schema hash does not match endpoint_schema_path")
+        if schema.objective_mode != str(mode):
+            raise ValueError("PolySeg-Sci objective_mode does not match the endpoint schema")
+
+        configured_primary = self._config_value(science, "primary_objective", None)
+        if configured_primary is None:
+            primary = schema.primary_index()
+        elif isinstance(configured_primary, str):
+            primary = schema.endpoint_index(configured_primary)
+        else:
+            if isinstance(configured_primary, bool) or not isinstance(configured_primary, int):
+                raise ValueError("PolySeg-Sci primary_objective must be an integer or endpoint id")
+            primary = configured_primary
+            primary = schema.primary_index(primary)
+        learning_rate = self._config_value(science, "dual_learning_rate", 0.01)
+        if isinstance(learning_rate, bool) or not isinstance(learning_rate, (int, float)) or learning_rate <= 0:
+            raise ValueError("PolySeg-Sci dual_learning_rate must be positive and finite")
+        initial = self._config_value(science, "initial_multipliers", None)
+        self.science_endpoint_schema = schema
+        self.science_dual_state = ConstraintDualState.initialize(
+            schema,
+            primary_objective=primary,
+            learning_rate=learning_rate,
+            initial_multipliers=initial,
+        )
+
+    def set_science_dual_state(self, payload: Any) -> ConstraintDualState:
+        """Restore a schema-bound dual state from a checkpoint payload."""
+
+        if isinstance(payload, ConstraintDualState):
+            payload = payload.state_dict()
+        if not isinstance(payload, Mapping):
+            raise ValueError("science dual checkpoint must be a state dictionary")
+        payload = dict(payload)
+        if self.science_endpoint_schema is None:
+            # This also validates that the current run is explicitly configured
+            # for constraint science before accepting checkpoint state.
+            self._initialize_science_dual_state(self.config)
+        if self.science_endpoint_schema is None:
+            raise RuntimeError("science dual state cannot be restored without an endpoint schema")
+        self.science_dual_state = ConstraintDualState.from_state_dict(self.science_endpoint_schema, payload)
+        return self.science_dual_state
+
+    def update_science_dual_state(self, estimates: Any) -> torch.Tensor:
+        """Apply projected dual ascent to an audited HF estimate vector."""
+
+        if self.science_dual_state is None or self.science_endpoint_schema is None:
+            raise RuntimeError("PolySeg-Sci dual state is not enabled")
+        return self.science_dual_state.update(self.science_endpoint_schema, estimates)
+
+    def _attach_science_objective_state(self, prompts: Any) -> None:
+        """Attach the current driver-side constraint vector to each prompt."""
+
+        if getattr(self, "science_dual_state", None) is None:
+            return
+        values = self.science_dual_state.multipliers.detach().cpu().to(torch.float32).tolist()
+        n = len(prompts)
+        if hasattr(prompts, "non_tensor_batch"):
+            prompts.non_tensor_batch["science_constraint_multipliers"] = np.asarray(
+                [values] * n, dtype=np.float32
+            )
+        else:
+            from verl.utils import tensordict_utils as tu
+
+            tu.assign_non_tensor_stack(prompts, "science_constraint_multipliers", [values] * n)
+
     def _prepare_polyseg_adaptive(self, prompts, *, validate: bool = False):
         """Choose and attach one adaptive pair to a rollout batch.
 
@@ -1429,6 +1885,7 @@ class AgentLoopManager:
         latter passes a TensorDict, so scalar metadata is wrapped with the
         TensorDict non-tensor helpers rather than assigned as a NumPy array.
         """
+        self._attach_science_objective_state(prompts)
         if self.polyseg_controller is None:
             return None
         if validate:
@@ -1447,8 +1904,10 @@ class AgentLoopManager:
             choice = self.polyseg_controller.choose(
                 episodes=max(1, len(prompts)),
                 horizon=max(1, int(getattr(self.rollout_config, "response_length", 1))),
-                feature_dim=max(1, int(getattr(self.rollout_config, "polyseg_feature_dim", 4))),
-                feedback=str(getattr(self.rollout_config, "polyseg_feedback", "sum")),
+                feature_dim=max(
+                    1, int(resolve_polyseg_option(self.config, "feature_dim", default=4))
+                ),
+                feedback=str(resolve_polyseg_option(self.config, "feedback", default="sum")),
             )
         episodes = max(1, len(prompts))
         values = {
@@ -1552,7 +2011,9 @@ class AgentLoopManager:
         if "priority" not in prompts.non_tensor_batch:
             prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
 
-        validate = bool(prompts.meta_info.get("validate", False))
+        validate = prompts.meta_info.get("validate", False)
+        if not isinstance(validate, bool):
+            raise ValueError("rollout validate flag must be boolean")
         adaptive_choice = self._prepare_polyseg_adaptive(prompts, validate=validate)
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
@@ -1570,10 +2031,10 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         output.meta_info["validate"] = validate
-        if adaptive_choice is not None and not validate:
-            # Cost is updated from the reward result below, after all workers
-            # have completed.  Planned and actual cost intentionally remain
-            # separate; terminal feedback may query fewer segments than m.
+        if adaptive_choice is not None and not validate and self.reward_loop_worker_handles is not None:
+            # Streaming reward workers have already completed verifier scoring
+            # before the rollout output reaches the manager.  Legacy colocated
+            # reward is accounted by the trainer after its reward call instead.
             actual = output.non_tensor_batch.get("segment_query_cost")
             actual_total = 0.0
             if actual is not None:

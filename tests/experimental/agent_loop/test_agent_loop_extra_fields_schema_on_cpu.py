@@ -33,8 +33,10 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import build_tool_observation_metadata
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
+from verl.trainer.ppo.polyseg_sci_provider import CallbackScienceRoundProvider
 
 
 class _FakeServerManager:
@@ -154,6 +156,70 @@ def test_agent_loop_output_as_dict_promotes_rollout_segment_ids_without_reward()
     fields = output.as_dict()
 
     assert torch.equal(fields["segment_ids"], torch.tensor([0, 0]))
+
+
+def test_agent_loop_output_promotes_polyseg_science_vector_contract():
+    output = _make_agent_loop_output()
+    output.extra_fields.update(
+        {
+            "science_boundary_values": np.asarray([[0.0], [0.8]], dtype=np.float32),
+            "science_boundary_mask": np.asarray([1], dtype=np.bool_),
+            "science_endpoint_mask": np.asarray([[1.0], [1.0]], dtype=np.bool_),
+            "science_pareto_alpha": np.asarray([1.0], dtype=np.float32),
+        }
+    )
+    fields = output.as_dict()
+    assert fields["science_boundary_values"].shape == (2, 1)
+    assert fields["science_boundary_mask"].dtype == torch.bool
+    assert fields["science_endpoint_mask"].dtype == torch.bool
+    assert fields["science_pareto_alpha"].dtype == torch.float32
+    assert "science_boundary_values" in fields["extra_fields"]
+
+
+def test_tool_observation_metadata_is_token_aligned_and_excludes_padding():
+    observation_mask, spans, action_masks = build_tool_observation_metadata(
+        [0, 0, 0, 1, 1, -1], [1, 1, 0, 1, 0, 0], 2
+    )
+    assert observation_mask == [False, False, True, False, True, False]
+    assert spans == [[(2, 3)], [(4, 5)]]
+    assert action_masks == [[True, True, False], [True, False]]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_agent_loop_worker_runs_configured_science_provider():
+    """The colocated worker must attach the same vector contract as TQ."""
+
+    output = _make_agent_loop_output()
+    fields = {
+        "segment_ids": torch.tensor([0, 0]),
+        "segment_mask": torch.tensor([True]),
+        "science_boundary_values": torch.tensor([[0.0], [1.0]]),
+        "science_boundary_mask": torch.tensor([True]),
+        "science_endpoint_mask": torch.tensor([[True], [True]]),
+    }
+
+    worker = object.__new__(AgentLoopWorker)
+    worker.science_round_provider = CallbackScienceRoundProvider(lambda _request: {"fields": fields})
+    await worker._apply_science_round([output], validate=False, kwargs={"trajectory_id": "t0"})
+
+    assert torch.equal(output.extra_fields["segment_ids"], fields["segment_ids"])
+    assert torch.equal(output.extra_fields["science_boundary_values"], fields["science_boundary_values"])
+
+
+@pytest.mark.asyncio
+async def test_science_provider_is_not_called_for_validation_rounds():
+    output = _make_agent_loop_output()
+    calls = []
+
+    async def callback(_request):
+        calls.append(True)
+        raise AssertionError("validation must not spend science-audit budget")
+
+    worker = object.__new__(AgentLoopWorker)
+    worker.science_round_provider = CallbackScienceRoundProvider(callback)
+    await worker._apply_science_round([output], validate=True, kwargs={})
+    assert calls == []
+    assert "science_boundary_values" not in output.extra_fields
 
 
 def test_agent_loop_output_as_dict_rejects_misaligned_rollout_segment_ids():
@@ -488,6 +554,54 @@ def test_agent_loop_postprocess_keeps_ragged_polyseg_rows_as_objects():
     assert rewards.shape == (2,) and rewards.dtype == object
     assert rewards[0].tolist() == [1.0]
     assert rewards[1].tolist() == [0.0, 2.0]
+
+
+def test_agent_loop_postprocess_pads_ragged_science_boundaries_with_masks():
+    metrics = AgentLoopMetrics()
+    inputs = [
+        _to_internal(
+            output_prompt_ids=[1], output_response_ids=[2, 3], output_response_mask=[1, 1],
+            metrics=metrics,
+            extra_fields={
+                "segment_ids": [0, 0],
+                "science_boundary_values": np.asarray([[0.0], [1.0]], dtype=np.float32),
+                "science_boundary_mask": np.asarray([True], dtype=np.bool_),
+                "science_endpoint_mask": np.asarray([[True], [True]], dtype=np.bool_),
+            }, num_turns=1, prompt_len=1, response_len=3,
+        ),
+        _to_internal(
+            output_prompt_ids=[1], output_response_ids=[4, 5, 6], output_response_mask=[1, 1, 1],
+            metrics=metrics,
+            extra_fields={
+                "segment_ids": [0, 1, 1],
+                "science_boundary_values": np.asarray([[0.0], [0.5], [1.0]], dtype=np.float32),
+                "science_boundary_mask": np.asarray([True, True], dtype=np.bool_),
+                "science_endpoint_mask": np.asarray([[True], [True], [True]], dtype=np.bool_),
+            }, num_turns=1, prompt_len=1, response_len=3,
+        ),
+    ]
+    merged = AgentLoopWorker._postprocess(type("_DummyWorker", (), {"reward_loop_worker_handles": None})(), inputs)
+    assert merged.batch["science_boundary_values"].shape == (2, 3, 1)
+    assert merged.batch["science_boundary_mask"].tolist() == [[True, False], [True, True]]
+    assert merged.batch["science_endpoint_mask"].tolist() == [[[True], [True], [False]], [[True], [True], [True]]]
+
+
+def test_agent_loop_postprocess_rejects_mixed_science_vector_presence():
+    metrics = AgentLoopMetrics()
+    inputs = [
+        _to_internal(
+            output_prompt_ids=[1], output_response_ids=[2], output_response_mask=[1],
+            metrics=metrics,
+            extra_fields={"science_boundary_values": np.asarray([[0.0], [1.0]], dtype=np.float32)},
+            num_turns=1, prompt_len=1, response_len=2,
+        ),
+        _to_internal(
+            output_prompt_ids=[1], output_response_ids=[3], output_response_mask=[1],
+            metrics=metrics, extra_fields={}, num_turns=1, prompt_len=1, response_len=2,
+        ),
+    ]
+    with pytest.raises(ValueError, match="present for every rollout"):
+        AgentLoopWorker._postprocess(type("_DummyWorker", (), {"reward_loop_worker_handles": None})(), inputs)
 
 
 @pytest.mark.asyncio

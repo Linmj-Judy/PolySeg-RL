@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from verl.utils.reward_score import default_compute_score
+from verl.trainer.ppo.polyseg import feedback_protocol_contract
 
 
 def _canonical_gsm8k_response(solution: str) -> str | None:
@@ -61,6 +62,7 @@ def compute_score(
             "utility": utility,
             "query_cost": float(extra_info.get("suffix_query_cost", extra_info.get("suffix_samples", 1))),
             "suffix_samples": int(extra_info.get("suffix_samples", 1)),
+            "feedback_protocol_contract": feedback_protocol_contract(protocol),
         }
 
     if protocol in {"terminal", "binary_local", "binary"}:
@@ -112,9 +114,14 @@ def compute_score(
                 "acc": float(verifier_info.get("acc", score > 0.5)),
                 "query_cost": float(extra_info.get("binary_query_cost", 1.0)),
                 "verifier_mode": verifier_mode,
+                "feedback_protocol_contract": feedback_protocol_contract(protocol),
             }
         if verifier_info:
-            verifier_info.update({"score": score, "verifier_mode": verifier_mode})
+            verifier_info.update({
+                "score": score,
+                "verifier_mode": verifier_mode,
+                "feedback_protocol_contract": feedback_protocol_contract(protocol),
+            })
             # GSM8K's strict scorer historically returned a scalar rather
             # than a structured ``{"score", "acc"}`` payload.  The score is
             # binary correctness for this task, so expose the observed
@@ -127,6 +134,7 @@ def compute_score(
                 "score": float(score),
                 "acc": float(score > 0.5),
                 "verifier_mode": verifier_mode,
+                "feedback_protocol_contract": feedback_protocol_contract(protocol),
             }
         return score
 

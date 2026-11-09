@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from verl.trainer.ppo.polyseg import feedback_protocol_contract
 from verl.utils.reward_score import default_compute_score
 
 
@@ -202,6 +203,7 @@ def compute_score(
         "utility": utility,
         "prm_score": utility,
         "model_derived_pseudo_label": True,
+        "feedback_protocol_contract": feedback_protocol_contract("prm_potential"),
         "prm_model_path": str(model_path),
         "query_cost": float(prm_query_cost),
         "prm_segment_id": int(extra_info.get("segment_id", 0)),

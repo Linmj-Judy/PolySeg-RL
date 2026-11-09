@@ -1,4 +1,5 @@
 from verl.experimental.agent_loop.single_turn_agent_loop import build_single_turn_segment_metadata
+import torch
 
 
 def test_single_turn_fixed_token_segments_ignore_non_action_tokens():
@@ -29,3 +30,20 @@ def test_single_turn_metadata_exports_rollout_owned_successor_features():
     assert metadata["segment_transition_mask"] == [True, True, False]
     assert len(metadata["segment_next_features"]) == 3
     assert metadata["segment_next_features"][-1] == [0.0, 0.0]
+
+
+def test_single_turn_external_step_features_use_actual_response_alignment():
+    metadata = build_single_turn_segment_metadata(
+        [1, 0, 1, 1], configured_m=2, feature_dim=2, feature_horizon=512,
+        state_features=torch.tensor([[0.1, 0.2], [9.0, 9.0], [0.3, 0.4], [0.5, 0.6]]),
+        state_mask=torch.tensor([True, False, True, True]),
+    )
+    assert len(metadata["segment_features"]) == 2
+
+
+def test_single_turn_exports_explicit_observation_and_action_metadata():
+    metadata = build_single_turn_segment_metadata([1, 1, 0, 1], configured_m=2)
+    assert metadata["tool_observation_mask"] == [False, False, False, False]
+    assert metadata["tool_observation_spans"] == [[], []]
+    assert metadata["segment_action_masks"] == [[True, True], [True]]
+    assert metadata["segment_action_mask"] == [True, True, False, True]

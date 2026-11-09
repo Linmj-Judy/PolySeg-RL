@@ -2,7 +2,9 @@
 
 The endpoint is an inference service owned by the rollout experiment.  It must
 accept ``{"prompt": ..., "prefix": ..., "num_samples": ...}`` and return
-``{"suffixes": ["...", ...]}``.  No local/random fallback is provided: if the
+``{"suffixes": ["...", ...], "billing_receipt": {...}}``.  The receipt is
+optional for compatibility, but required before a lower bill can be accepted.
+No local/random fallback is provided: if the
 suffix service is unavailable, the run fails instead of silently changing the
 feedback semantics.
 """
@@ -18,6 +20,14 @@ from urllib.request import Request, urlopen
 import numpy as np
 
 from verl.utils.reward_score import default_compute_score
+
+
+class _SuffixSamples(list[str]):
+    """List-compatible suffix batch carrying optional provider evidence."""
+
+    def __init__(self, values: list[str], billing_receipt: dict[str, Any] | None = None):
+        super().__init__(values)
+        self.billing_receipt = billing_receipt
 
 
 def _strict_suffix_score(data_source: str, solution: str, ground_truth: str, extra_info: dict[str, Any]) -> float:
@@ -74,6 +84,7 @@ def _sample_suffixes(prompt: Any, prefix: str, num_samples: int) -> list[str]:
             "prompt": _normalise_prompt(prompt),
             "prefix": prefix,
             "num_samples": int(num_samples),
+            "cost_per_sample": float(os.environ.get("POLYSEG_SUFFIX_COST_PER_SAMPLE", "1.0")),
             "temperature": float(os.environ.get("POLYSEG_SUFFIX_TEMPERATURE", "1.0")),
             "max_tokens": int(os.environ.get("POLYSEG_SUFFIX_MAX_TOKENS", "1024")),
             "seed": (
@@ -93,7 +104,8 @@ def _sample_suffixes(prompt: Any, prefix: str, num_samples: int) -> list[str]:
         raise ValueError(
             f"suffix endpoint returned {len(suffixes)} samples; expected exactly {int(num_samples)}"
         )
-    return suffixes
+    billing_receipt = result.get("billing_receipt") if isinstance(result, dict) else None
+    return _SuffixSamples(suffixes, billing_receipt)
 
 
 def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict[str, Any] | None = None):
@@ -114,7 +126,13 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
         )
 
     prefix = str(extra_info.get("segment_prefix", ""))
-    suffixes = _sample_suffixes(extra_info.get("raw_prompt"), prefix, samples)
+    sampled = _sample_suffixes(extra_info.get("raw_prompt"), prefix, samples)
+    # Keep compatibility with local tests and custom samplers that return only
+    # the suffix list; real providers may additionally return billing evidence.
+    if isinstance(sampled, tuple) and len(sampled) == 2:
+        suffixes, billing_receipt = sampled
+    else:
+        suffixes, billing_receipt = sampled, getattr(sampled, "billing_receipt", None)
     outcomes = []
     for suffix in suffixes:
         outcome = _strict_suffix_score(data_source, prefix + suffix, ground_truth, extra_info)
@@ -126,6 +144,8 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
         "suffix_samples": len(suffixes),
         "suffix_successes": int(sum(outcomes)),
     }
+    if billing_receipt is not None:
+        result["billing_receipt"] = billing_receipt
     # Utility and observed final correctness are different signals.  When the
     # manager supplies the complete response on the terminal segment, expose a
     # local exact-verifier diagnostic without counting it as a suffix sample.

@@ -31,11 +31,21 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.trainer.ppo.polyseg_sci_provider import (
+    ScienceRoundRequest,
+    attach_science_response,
+)
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _strict_validate_flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("validate must be boolean")
+    return value
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -53,12 +63,15 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # ``AgentLoopWorker`` loads the explicit provider for both colocated
+        # and TransferQueue paths.  Keep the same worker-local adapter here;
+        # its ledger/state must be backed by the configured external harness.
         tq.init()
         self.background_tasks = set()
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
-        validate = batch["validate"] if "validate" in batch else False
+        validate = _strict_validate_flag(batch["validate"] if "validate" in batch else False)
         batch.pop("validate", None)
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
@@ -109,6 +122,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
+        _strict_validate_flag(trajectory.get("validate", False))
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         tasks = []
@@ -154,15 +168,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
+        validate = _strict_validate_flag(validate)
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
-        await self._compute_score(outputs, kwargs={**kwargs, "validate": bool(validate)})
+        await self._compute_score(outputs, kwargs={**kwargs, "validate": validate})
 
         final_output = outputs[-1]
+        science_round_provider = getattr(self, "science_round_provider", None)
+        if science_round_provider is not None and not validate:
+            # Science evaluation belongs after ordinary reward capture and
+            # before TransferQueue persistence.  Keeping this callback here
+            # prevents evaluator/restore/query side effects from entering the
+            # pure PPO advantage function.
+            request = ScienceRoundRequest(
+                output=final_output,
+                outputs=tuple(outputs),
+                validate=validate,
+                context={**kwargs, "validate": validate},
+            )
+            response = await science_round_provider.execute(request)
+            attach_science_response(outputs, response)
+
         # TODO: Support output:list[AgentLoopOutput]
         await self._compute_teacher_logprobs(
             final_output,

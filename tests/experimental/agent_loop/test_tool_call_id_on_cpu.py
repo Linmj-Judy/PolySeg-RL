@@ -120,7 +120,13 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
         ):
             del previous_messages, response_logprobs, tools
             captured_messages.extend(updated_messages)
-            merge_result = SimpleNamespace(token_ids=list(runtime_token_ids) + [41, 42])
+            merge_result = SimpleNamespace(
+                token_ids=list(runtime_token_ids) + [41, 42],
+                appended_token_count=2,
+                inserted_token_ids=[],
+                removed_prefix_token_count=0,
+                kind="context",
+            )
             return merge_result, list(response_mask) + [0, 0], None
 
         loop = SimpleNamespace(
@@ -159,6 +165,7 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
             response_logprobs=[],
             image_data=None,
             user_turns=0,
+            segment_tool_observation_spans={},
         )
 
         state = await ToolAgentLoop._handle_processing_tools_state(loop, agent_data)
@@ -173,6 +180,9 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
         assert agent_data.prompt_ids == [1, 2, 3, 41, 42]
         assert agent_data.response_mask == [0, 0]
         assert agent_data.tool_rewards == [1.0]
+        assert agent_data.segment_tool_observation_spans[0] == [
+            {"start": 0, "end": 2, "tool_call_ids": ["call-get_weather-0"]}
+        ]
 
 
 if __name__ == "__main__":

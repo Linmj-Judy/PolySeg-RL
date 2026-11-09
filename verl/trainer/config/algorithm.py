@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,8 +23,113 @@ __all__ = [
     "FilterGroupsConfig",
     "KLControlConfig",
     "RolloutCorrectionConfig",
+    "PolySegScienceConfig",
     "PolySegAlgorithmConfig",
 ]
+
+
+def _strict_bool(value: Any, name: str) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be boolean")
+
+
+def _strict_int(value: Any, name: str, *, minimum: int = 0) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
+def _strict_real(value: Any, name: str, *, minimum: float = 0.0, strictly_positive: bool = False) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite real number")
+    numeric = float(value)
+    if (strictly_positive and numeric <= minimum) or (not strictly_positive and numeric < minimum):
+        comparator = ">" if strictly_positive else ">="
+        raise ValueError(f"{name} must be {comparator} {minimum}")
+
+
+@dataclass
+class PolySegScienceConfig(BaseConfig):
+    """PolySeg-Sci v4 configuration.
+
+    The scalar ``algorithm.polyseg`` fields remain the compatibility path for
+    existing experiments.  Setting ``enabled`` activates the vector,
+    multi-fidelity audit contract implemented in ``polyseg_sci``; endpoint
+    schemas and feature-map files are loaded by the caller and fingerprinted
+    into each run sidecar.
+    """
+
+    enabled: bool = False
+    objective_mode: str = "preference"
+    endpoint_schema_path: str = ""
+    endpoint_schema_hash: str = ""
+    feature_map_path: str = ""
+    feature_map_hash: str = ""
+    provider_path: str = ""
+    segment_rule: str = "fixed_action_tokens"
+    segment_rule_version: str = "polyseg-sci-causal-boundary-v1"
+    query_mode: str = "uniform"
+    hard_budget: bool = False
+    train_budget: float | None = None
+    predictor_q: int = 2
+    predictor_basis: str = "total"
+    predictor_ridge_lambda: float = 1.0
+    branch_count: int = 1
+    require_restore_audit: bool = True
+    policy_update: str = "preference"
+    normalize_advantages: bool = False
+    endpoint_weights: tuple[float, ...] | None = None
+    primary_objective: int | str | None = None
+    initial_multipliers: tuple[float, ...] | None = None
+    dual_learning_rate: float = 0.01
+    allow_dual_bootstrap: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "hard_budget", "require_restore_audit", "normalize_advantages", "allow_dual_bootstrap"):
+            _strict_bool(getattr(self, name), f"science {name}")
+        if self.objective_mode not in {"pareto", "preference", "constraint"}:
+            raise ValueError("polyseg science objective_mode is invalid")
+        if self.query_mode not in {"uniform", "adaptive"}:
+            raise ValueError("polyseg science query_mode is invalid")
+        _strict_int(self.predictor_q, "science predictor_q", minimum=0)
+        _strict_int(self.branch_count, "science branch_count", minimum=1)
+        _strict_real(self.predictor_ridge_lambda, "science predictor_ridge_lambda", strictly_positive=True)
+        if self.train_budget is not None:
+            _strict_real(self.train_budget, "science train_budget")
+        if self.policy_update not in {"pareto", "preference", "constraint"}:
+            raise ValueError("polyseg science policy_update is invalid")
+        if self.objective_mode != "preference" and self.policy_update not in {"preference", self.objective_mode}:
+            raise ValueError("polyseg science objective_mode and policy_update disagree")
+        effective_mode = self.objective_mode
+        # ``policy_update`` is the name used by early v4 configs.  Keep it as
+        # a compatibility alias when the new objective_mode is left at its
+        # default, but reject invalid values and validate the effective mode.
+        if self.objective_mode == "preference" and self.policy_update != "preference":
+            effective_mode = self.policy_update
+        if effective_mode == "constraint" and self.primary_objective is None:
+            raise ValueError("constraint science mode requires explicit primary_objective")
+        if self.endpoint_weights is not None:
+            if not self.endpoint_weights or any(
+                isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(float(w)) or float(w) < 0
+                for w in self.endpoint_weights
+            ):
+                raise ValueError("science endpoint_weights must be finite and non-negative")
+            if sum(float(w) for w in self.endpoint_weights) <= 0:
+                raise ValueError("science endpoint_weights must contain a positive weight")
+        if self.primary_objective is not None:
+            if isinstance(self.primary_objective, bool) or not isinstance(self.primary_objective, (int, str)):
+                raise ValueError("science primary_objective must be an endpoint index or endpoint id")
+            if isinstance(self.primary_objective, int) and self.primary_objective < 0:
+                raise ValueError("science primary_objective must be non-negative")
+        if self.initial_multipliers is not None:
+            if not self.initial_multipliers or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+                for value in self.initial_multipliers
+            ):
+                raise ValueError("science initial_multipliers must be finite and non-negative")
+        _strict_real(self.dual_learning_rate, "science dual_learning_rate", strictly_positive=True)
 
 
 @dataclass
@@ -50,6 +156,7 @@ class PolySegAlgorithmConfig(BaseConfig):
     basis: str = "total"
     normalized_basis: bool = False
     feedback: str = "sum"
+    reward_route: str = "macro"
     ridge_lambda: float = 1.0
     logistic_l2: float = 1.0
     normalize_advantages: bool = True
@@ -72,13 +179,24 @@ class PolySegAlgorithmConfig(BaseConfig):
     use_confidence_bonus: bool = False
     reward_confidence_beta: float = 1.0
     transition_confidence_beta: float = 1.0
+    confidence_delta: float = 0.05
+    use_formal_confidence_radius: bool = False
+    bellman_closure_tolerance: float = 0.0
     use_transition_estimator: bool = False
     transition_ridge_lambda: float = 1.0
     transition_backup_iterations: int = 1
     # Macro-critic observation weighting for variable-length agentic segments.
     critic_weighting: str = "duration"
+    # Bounded prior trajectory history for persistent prequential OOF
+    # dependence diagnostics.
+    dependence_history_limit: int = 128
+
+    # Independent checkpointable identity for confidence/dependence state.
+    dependence_state_id: str = ""
+
     accumulate_estimator: bool = False
     estimator_state_id: str = ""
+    science: PolySegScienceConfig = field(default_factory=PolySegScienceConfig)
 
 
 @dataclass

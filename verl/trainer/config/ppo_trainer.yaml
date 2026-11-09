@@ -95,6 +95,35 @@ algorithm:
     # Fixed response horizon used by the macro feature map.
     feature_horizon: null
 
+    # PolySeg-Sci v4 vector endpoint/multi-fidelity path. Disabled preserves
+    # the scalar terminal-feedback compatibility configuration above.
+    science:
+      _target_: verl.trainer.config.PolySegScienceConfig
+      enabled: False
+      objective_mode: preference
+      endpoint_schema_path: ""
+      endpoint_schema_hash: ""
+      feature_map_path: ""
+      feature_map_hash: ""
+      provider_path: ""
+      segment_rule: fixed_action_tokens
+      segment_rule_version: polyseg-sci-causal-boundary-v1
+      query_mode: uniform
+      hard_budget: False
+      train_budget: null
+      predictor_q: 2
+      predictor_basis: total
+      predictor_ridge_lambda: 1.0
+      branch_count: 1
+      require_restore_audit: True
+      policy_update: preference
+      normalize_advantages: False
+      endpoint_weights: null
+      primary_objective: null
+      initial_multipliers: null
+      dual_learning_rate: 0.01
+      allow_dual_bootstrap: False
+
     # Fit a frozen-basis ridge/logistic macro critic from macro return targets
     # before computing duration-aware macro GAE.
     use_polynomial_critic: False
@@ -118,11 +147,20 @@ algorithm:
     # Feedback protocol: sum or binary.
     feedback: sum
 
+    # Reward estimation route: direct macro feedback or shared step reward
+    # recovery from rollout-provided frozen per-step features.
+    reward_route: macro
+
     # Ridge regularization for sum feedback.
     ridge_lambda: 1.0
 
     # L2 regularization for binary feedback.
     logistic_l2: 1.0
+
+    # Explicit finite-sample confidence level and Bellman closure audit limit.
+    confidence_delta: 0.05
+    use_formal_confidence_radius: False
+    bellman_closure_tolerance: 0.0
 
     # Whiten macro advantages before scattering to tokens.
     normalize_advantages: True
@@ -150,6 +188,13 @@ algorithm:
     # Weight critic observations by rollout-owned segment duration.  Use
     # ``uniform`` for equal-weight ablations.
     critic_weighting: duration
+
+    # Bounded prior trajectory history for prequential OOF dependence
+    # diagnostics.  It is checkpointed with PolySeg estimator state.
+    dependence_history_limit: 128
+
+    # Independent checkpointable identity for confidence/dependence state.
+    dependence_state_id: ""
 
     # Accumulate polynomial ridge sufficient statistics across trainer batches.
     accumulate_estimator: False

@@ -105,6 +105,11 @@ def need_critic(config: DictConfig) -> bool:
         "polyseg_gae",
     ):
         return True
+    elif config.algorithm.adv_estimator in (AdvantageEstimator.POLYSEG_SCI, "polyseg_sci"):
+        # The science predictor is an external, frozen value estimator.  A
+        # trainable token critic would mix two value targets and violate the
+        # v4 residual-correction contract.
+        return False
     else:
         warnings.warn(
             "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",

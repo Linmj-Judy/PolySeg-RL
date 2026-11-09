@@ -26,10 +26,39 @@ import sys
 import fcntl
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping, Sequence
+from numbers import Real
 from uuid import uuid4
 
 import numpy as np
 import torch
+
+
+def _strict_int(value: Any, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _strict_real(value: Any, name: str, *, minimum: float = 0.0, strictly_positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be a finite real number")
+    numeric = float(value)
+    if (strictly_positive and numeric <= minimum) or (not strictly_positive and numeric < minimum):
+        raise ValueError(f"{name} must be {'>' if strictly_positive else '>='} {minimum}")
+    return numeric
+
+
+def _strict_nonnegative_int(value: Any, name: str) -> int:
+    """Parse a checkpoint counter without truncating fractional values."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(numeric)
 
 
 __all__ = [
@@ -40,10 +69,14 @@ __all__ = [
     "FileBackedSegmentRewardBudget",
     "PolynomialSegmentCritic",
     "PolynomialEstimatorState",
+    "PolySegDependenceState",
     "RidgeEstimatorState",
     "reset_polyseg_estimator_state",
     "polyseg_estimator_state_dict",
     "load_polyseg_estimator_state_dict",
+    "reset_polyseg_dependence_state",
+    "polyseg_dependence_state_dict",
+    "load_polyseg_dependence_state_dict",
     "MLPSegmentCritic",
     "PolynomialTransitionEstimator",
     "SegmentTrace",
@@ -67,6 +100,8 @@ __all__ = [
     "macro_bellman_backup",
     "POLYSEG_PROTOCOLS",
     "normalize_feedback_protocol",
+    "resolve_polyseg_option",
+    "feedback_protocol_contract",
     "decode_token_ids",
     "extract_segment_metadata",
     "build_segment_features",
@@ -79,6 +114,20 @@ __all__ = [
     "ridge_feature_norms",
     "confidence_bonus",
     "transition_confidence_bonus",
+    "FrozenLowDimRepresentation",
+    "load_frozen_representation",
+    "aggregate_step_features",
+    "SharedStepRewardEstimator",
+    "recover_step_rewards_from_segment_feedback",
+    "dependence_confidence_radius",
+    "bellman_closure_residual",
+    "segment_comparator_regret",
+    "budget_comparator_regret",
+    "compression_gap",
+    "full_step_comparator_regret",
+    "budget_feasible_segments",
+    "unified_regret_bound",
+    "PolySegRegretTracker",
 ]
 
 
@@ -121,6 +170,9 @@ def feature_map_contract(
         coordinate_order.extend(["zero_pad"] * (int(feature_dim) - len(coordinate_order)))
     spec = {
         "version": POLYSEG_FEATURE_MAP_VERSION,
+        "semantic_role": "rollout_observable_boundary_state_action_summary",
+        "causal_availability": "available_at_segment_boundary",
+        "markov_sufficiency": "not_established",
         "response_length": int(response_length),
         "feature_dim": int(feature_dim),
         "feature_horizon": horizon,
@@ -134,6 +186,9 @@ def feature_map_contract(
     payload = json.dumps(spec, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return {
         "version": POLYSEG_FEATURE_MAP_VERSION,
+        "semantic_role": spec["semantic_role"],
+        "causal_availability": spec["causal_availability"],
+        "markov_sufficiency": spec["markov_sufficiency"],
         "hash": hashlib.sha256(payload).hexdigest(),
         "spec": spec,
     }
@@ -153,7 +208,7 @@ class PolynomialEstimatorState:
     same trainer step and be restored atomically.
     """
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(
         self,
@@ -164,6 +219,8 @@ class PolynomialEstimatorState:
         normalized_basis: bool = False,
         ridge_lambda: float = 1.0,
         transition_ridge_lambda: float | None = None,
+        dependence_history_limit: int = 128,
+        feedback: str = "local_sum",
     ):
         if q < 0 or feature_dim < 1:
             raise ValueError("q must be non-negative and feature_dim must be positive")
@@ -175,18 +232,29 @@ class PolynomialEstimatorState:
             transition_ridge_lambda = ridge_lambda
         if transition_ridge_lambda <= 0:
             raise ValueError("transition_ridge_lambda must be positive")
+        if int(dependence_history_limit) < 0:
+            raise ValueError("dependence_history_limit must be non-negative")
         self.q = int(q)
         self.feature_dim = int(feature_dim)
         self.basis = basis
         self.normalized_basis = bool(normalized_basis)
         self.ridge_lambda = float(ridge_lambda)
         self.transition_ridge_lambda = float(transition_ridge_lambda)
+        self.dependence_history_limit = int(dependence_history_limit)
+        # The sufficient statistics are protocol-specific.  Persisting the
+        # canonical feedback name prevents an accumulating state created for
+        # one reward semantics from being silently reused by another.
+        self.feedback = normalize_feedback_protocol(feedback)
         self.sample_count = 0
         self.transition_sample_count = 0
         self.gram: torch.Tensor | None = None
         self.rhs: torch.Tensor | None = None
         self.transition_gram: torch.Tensor | None = None
         self.transition_rhs: torch.Tensor | None = None
+        # Compact, bounded history for prequential cross-batch OOF
+        # dependence diagnostics.  Entries contain polynomial design rows,
+        # labels and observation weights, never token-level rollout data.
+        self.dependence_history: list[dict[str, torch.Tensor]] = []
 
     @property
     def dimension(self) -> int:
@@ -257,6 +325,54 @@ class PolynomialEstimatorState:
         eye = torch.eye(self.dimension, dtype=self.transition_gram.dtype, device=self.transition_gram.device)
         return torch.linalg.solve(self.transition_gram + self.transition_ridge_lambda * eye, self.transition_rhs)
 
+    def append_dependence_history(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        weights: torch.Tensor | None = None,
+        score_residuals: torch.Tensor | None = None,
+    ) -> None:
+        """Store complete valid trajectories for future cross-batch OOF fits.
+
+        The history is detached to CPU and bounded by
+        ``dependence_history_limit``. It is used only by dependence
+        diagnostics, so it cannot alter the policy-gradient target.
+        """
+        if self.dependence_history_limit == 0:
+            return
+        x = _as_tensor(features).detach()
+        y = _as_tensor(targets, device=x.device).detach()
+        mask = _as_tensor(valid_mask, device=x.device).to(torch.bool)
+        if x.ndim != 3 or y.ndim != 2 or x.shape[:2] != y.shape or mask.shape != y.shape:
+            raise ValueError("dependence history tensors have incompatible shapes")
+        if weights is None:
+            w = torch.ones_like(y, dtype=torch.float32)
+        else:
+            w = _as_tensor(weights, device=x.device).detach().to(torch.float32)
+            if w.shape != y.shape:
+                raise ValueError("dependence history weights must match targets")
+        if score_residuals is None:
+            raise ValueError("score_residuals are required for persistent OOF history")
+        scores = _as_tensor(score_residuals, device=x.device).detach()
+        if scores.ndim != 3 or scores.shape[:2] != y.shape or scores.shape[-1] != self.dimension:
+            raise ValueError("score_residuals must have shape [batch, segments, dimension]")
+        for row in range(x.shape[0]):
+            keep = mask[row]
+            if not bool(keep.any()):
+                continue
+            self.dependence_history.append(
+                {
+                    "features": x[row][keep].cpu(),
+                    "targets": y[row][keep].cpu(),
+                    "weights": w[row][keep].cpu(),
+                    "scores": scores[row][keep].cpu(),
+                }
+            )
+        if len(self.dependence_history) > self.dependence_history_limit:
+            self.dependence_history = self.dependence_history[-self.dependence_history_limit :]
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "version": self.VERSION,
@@ -266,33 +382,87 @@ class PolynomialEstimatorState:
             "normalized_basis": self.normalized_basis,
             "ridge_lambda": self.ridge_lambda,
             "transition_ridge_lambda": self.transition_ridge_lambda,
+            "dependence_history_limit": self.dependence_history_limit,
+            "feedback": self.feedback,
             "sample_count": self.sample_count,
             "transition_sample_count": self.transition_sample_count,
             "gram": None if self.gram is None else self.gram.detach().cpu(),
             "rhs": None if self.rhs is None else self.rhs.detach().cpu(),
             "transition_gram": None if self.transition_gram is None else self.transition_gram.detach().cpu(),
             "transition_rhs": None if self.transition_rhs is None else self.transition_rhs.detach().cpu(),
+            "dependence_history": [
+                {key: value.detach().cpu() for key, value in item.items()}
+                for item in self.dependence_history
+            ],
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> "PolynomialEstimatorState":
         for name in ("q", "feature_dim", "basis"):
             if name in state and getattr(self, name) != state[name]:
                 raise ValueError(f"estimator state {name} does not match configured estimator")
-        self.sample_count = int(state.get("sample_count", 0))
-        self.transition_sample_count = int(state.get("transition_sample_count", 0))
+        if "normalized_basis" in state and bool(state["normalized_basis"]) != self.normalized_basis:
+            raise ValueError("estimator normalized-basis setting does not match configured estimator")
+        for name in ("ridge_lambda", "transition_ridge_lambda"):
+            if name in state:
+                value = float(state[name])
+                expected = getattr(self, name)
+                if not math.isfinite(value) or value <= 0 or not math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(f"estimator state {name} does not match configured estimator")
+        if "feedback" not in state:
+            # Version-1 checkpoints predate the protocol field and are only
+            # unambiguous for the historical local-sum default.  Refuse to
+            # load them into any other feedback semantics instead of silently
+            # reusing reward statistics under a different target.
+            if self.feedback != "local_sum":
+                raise ValueError("estimator state is missing feedback semantics")
+        elif normalize_feedback_protocol(state["feedback"]) != self.feedback:
+            raise ValueError("estimator state feedback does not match configured estimator")
+        self.sample_count = _strict_nonnegative_int(state.get("sample_count", 0), "sample_count")
+        self.transition_sample_count = _strict_nonnegative_int(
+            state.get("transition_sample_count", 0), "transition_sample_count"
+        )
+        if "dependence_history_limit" in state:
+            history_limit = _strict_nonnegative_int(state["dependence_history_limit"], "dependence_history_limit")
+            if history_limit != self.dependence_history_limit:
+                raise ValueError("estimator dependence history limit does not match configured state")
         for name in ("gram", "rhs", "transition_gram", "transition_rhs"):
             value = state.get(name)
             setattr(self, name, None if value is None else _as_tensor(value))
+            if value is not None and not torch.isfinite(getattr(self, name)).all():
+                raise ValueError(f"invalid non-finite values in estimator state {name}")
         if self.gram is not None and self.gram.shape != (self.dimension, self.dimension):
             raise ValueError("invalid reward Gram shape in estimator state")
         if self.rhs is not None and self.rhs.shape != (self.dimension,):
             raise ValueError("invalid reward target shape in estimator state")
         if self.transition_gram is not None and self.transition_gram.shape != (self.dimension, self.dimension):
             raise ValueError("invalid transition Gram shape in estimator state")
-        if self.transition_rhs is not None and self.transition_rhs.shape[0] != self.dimension:
+        if self.transition_rhs is not None and (self.transition_rhs.ndim != 2 or self.transition_rhs.shape[0] != self.dimension):
             raise ValueError("invalid transition target shape in estimator state")
         if self.sample_count < 0 or self.transition_sample_count < 0:
             raise ValueError("estimator sample counts must be non-negative")
+        history = state.get("dependence_history", [])
+        if not isinstance(history, (list, tuple)):
+            raise ValueError("invalid dependence history")
+        restored: list[dict[str, torch.Tensor]] = []
+        for item in history:
+            if not isinstance(item, Mapping) or not {"features", "targets", "weights", "scores"}.issubset(item):
+                raise ValueError("invalid dependence history entry")
+            x = _as_tensor(item["features"]).detach().cpu()
+            y = _as_tensor(item["targets"]).detach().cpu().reshape(-1)
+            w = _as_tensor(item["weights"]).detach().cpu().reshape(-1)
+            scores = _as_tensor(item["scores"]).detach().cpu()
+            if x.ndim != 2 or x.shape[1] != self.dimension or y.shape != w.shape or x.shape[0] != y.shape[0] or scores.shape != x.shape:
+                raise ValueError("invalid dependence history entry shape")
+            if (
+                x.shape[0] == 0
+                or not torch.isfinite(x).all()
+                or not torch.isfinite(y).all()
+                or not torch.isfinite(w).all()
+                or not torch.isfinite(scores).all()
+            ):
+                raise ValueError("invalid dependence history values")
+            restored.append({"features": x, "targets": y, "weights": w, "scores": scores})
+        self.dependence_history = restored[-self.dependence_history_limit :] if self.dependence_history_limit else []
         return self
 
     @classmethod
@@ -304,8 +474,76 @@ class PolynomialEstimatorState:
             normalized_basis=bool(state.get("normalized_basis", False)),
             ridge_lambda=float(state.get("ridge_lambda", 1.0)),
             transition_ridge_lambda=float(state.get("transition_ridge_lambda", state.get("ridge_lambda", 1.0))),
+            dependence_history_limit=_strict_nonnegative_int(
+                state.get("dependence_history_limit", 128), "dependence_history_limit"
+            ),
+            feedback=state.get("feedback", "local_sum"),
         )
         return obj.load_state_dict(state)
+
+
+class PolySegDependenceState(PolynomialEstimatorState):
+    """Persistent dependence diagnostics and online-radius state.
+
+    This state is intentionally separate from the accumulating critic state.
+    A confidence bonus must use the radius observed *before* the current
+    batch; the current batch can update this object only after its advantage
+    computation has completed successfully.  The inherited bounded history
+    stores compact design/target/score rows for strict prequential OOF fits.
+    """
+
+    DEPENDENCE_VERSION = 1
+
+    def __init__(self, *, feedback: str = "local_sum", **kwargs: Any):
+        super().__init__(feedback=feedback, **kwargs)
+        self.dependence_radius_multiplier = 1.0
+        self.dependence_diagnostic_batches = 0
+
+    def update_dependence_radius(self, multiplier: float) -> None:
+        value = float(multiplier)
+        if not math.isfinite(value) or value < 1.0:
+            raise ValueError("dependence radius multiplier must be finite and at least one")
+        self.dependence_radius_multiplier = value
+        self.dependence_diagnostic_batches += 1
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state.update(
+            {
+                "dependence_state_version": self.DEPENDENCE_VERSION,
+                "dependence_radius_multiplier": self.dependence_radius_multiplier,
+                "dependence_diagnostic_batches": self.dependence_diagnostic_batches,
+                "feedback": self.feedback,
+            }
+        )
+        return state
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "PolySegDependenceState":
+        obj = cls(
+            q=int(state["q"]),
+            feature_dim=int(state["feature_dim"]),
+            basis=state.get("basis", "total"),
+            normalized_basis=bool(state.get("normalized_basis", False)),
+            ridge_lambda=float(state.get("ridge_lambda", 1.0)),
+            transition_ridge_lambda=float(
+                state.get("transition_ridge_lambda", state.get("ridge_lambda", 1.0))
+            ),
+            dependence_history_limit=_strict_nonnegative_int(
+                state.get("dependence_history_limit", 128), "dependence_history_limit"
+            ),
+            feedback=state.get("feedback", "local_sum"),
+        )
+        PolynomialEstimatorState.load_state_dict(obj, state)
+        obj.dependence_radius_multiplier = float(state.get("dependence_radius_multiplier", 1.0))
+        obj.dependence_diagnostic_batches = _strict_nonnegative_int(
+            state.get("dependence_diagnostic_batches", 0), "dependence_diagnostic_batches"
+        )
+        if not math.isfinite(obj.dependence_radius_multiplier) or obj.dependence_radius_multiplier < 1.0:
+            raise ValueError("invalid dependence radius multiplier")
+        if obj.dependence_diagnostic_batches < 0:
+            raise ValueError("invalid dependence diagnostic batch count")
+        return obj
 
 
 # A short alias makes the intent clear to callers that use this as a generic
@@ -314,6 +552,7 @@ RidgeEstimatorState = PolynomialEstimatorState
 
 
 _POLYSEG_ESTIMATOR_STATES: dict[str, PolynomialEstimatorState] = {}
+_POLYSEG_DEPENDENCE_STATES: dict[str, PolySegDependenceState] = {}
 
 
 def _resolve_estimator_state(
@@ -331,12 +570,47 @@ def _resolve_estimator_state(
         normalized_basis=config.normalized_basis,
         ridge_lambda=config.ridge_lambda,
         transition_ridge_lambda=config.transition_ridge_lambda,
+        dependence_history_limit=config.dependence_history_limit,
+        feedback=normalize_feedback_protocol(config.feedback),
     )
     current = _POLYSEG_ESTIMATOR_STATES.get(state_id)
     if current is None:
         current = _POLYSEG_ESTIMATOR_STATES[state_id] = PolynomialEstimatorState(**expected)
     elif any(getattr(current, key) != value for key, value in expected.items()):
         raise ValueError(f"estimator_state_id={state_id!r} is already bound to a different PolySeg configuration")
+    return current
+
+
+def _resolve_dependence_state(config: "PolySegConfig") -> PolySegDependenceState | None:
+    """Resolve the independent persistent state used by confidence bonuses."""
+
+    if not config.use_confidence_bonus:
+        return None
+    expected = dict(
+        q=config.q,
+        feature_dim=config.feature_dim,
+        basis=config.basis,
+        normalized_basis=config.normalized_basis,
+        ridge_lambda=config.ridge_lambda,
+        transition_ridge_lambda=config.transition_ridge_lambda,
+        dependence_history_limit=config.dependence_history_limit,
+        feedback=normalize_feedback_protocol(config.feedback),
+    )
+    if config.dependence_state_id:
+        state_id = config.dependence_state_id
+    elif config.estimator_state_id:
+        state_id = f"{config.estimator_state_id}:dependence"
+    else:
+        # Keep independent defaults for genuinely different estimator
+        # geometries while allowing repeated calls in one run to share state.
+        state_id = "__polyseg_dependence_default__:" + json.dumps(
+            expected, sort_keys=True, separators=(",", ":")
+        )
+    current = _POLYSEG_DEPENDENCE_STATES.get(state_id)
+    if current is None:
+        current = _POLYSEG_DEPENDENCE_STATES[state_id] = PolySegDependenceState(**expected)
+    elif any(getattr(current, key) != value for key, value in expected.items()):
+        raise ValueError(f"dependence_state_id={state_id!r} is already bound to a different PolySeg configuration")
     return current
 
 
@@ -347,6 +621,15 @@ def reset_polyseg_estimator_state(state_id: str | None = None) -> None:
         _POLYSEG_ESTIMATOR_STATES.clear()
     else:
         _POLYSEG_ESTIMATOR_STATES.pop(str(state_id), None)
+
+
+def reset_polyseg_dependence_state(state_id: str | None = None) -> None:
+    """Reset one confidence/dependence state, or all such states."""
+
+    if state_id is None:
+        _POLYSEG_DEPENDENCE_STATES.clear()
+    else:
+        _POLYSEG_DEPENDENCE_STATES.pop(str(state_id), None)
 
 
 def polyseg_estimator_state_dict(state_id: str | None = None) -> dict[str, Any]:
@@ -367,6 +650,24 @@ def load_polyseg_estimator_state_dict(state: Mapping[str, Any], *, clear: bool =
         _POLYSEG_ESTIMATOR_STATES[str(state_id)] = PolynomialEstimatorState.from_state_dict(payload)
 
 
+def polyseg_dependence_state_dict(state_id: str | None = None) -> dict[str, Any]:
+    """Return CPU-serializable persistent confidence/dependence snapshots."""
+
+    if state_id is not None:
+        state = _POLYSEG_DEPENDENCE_STATES.get(str(state_id))
+        return {} if state is None else {str(state_id): state.state_dict()}
+    return {key: value.state_dict() for key, value in _POLYSEG_DEPENDENCE_STATES.items()}
+
+
+def load_polyseg_dependence_state_dict(state: Mapping[str, Any], *, clear: bool = False) -> None:
+    """Restore persistent confidence/dependence states from a checkpoint."""
+
+    if clear:
+        _POLYSEG_DEPENDENCE_STATES.clear()
+    for state_id, payload in state.items():
+        _POLYSEG_DEPENDENCE_STATES[str(state_id)] = PolySegDependenceState.from_state_dict(payload)
+
+
 # ``sum``/``binary`` are retained as compatibility aliases for the original
 # smoke-test configuration.  The canonical names make the scorer contract
 # explicit: a scorer either returns a local macro reward, a utility/potential,
@@ -377,6 +678,77 @@ POLYSEG_PROTOCOLS = frozenset(
         "sum", "binary", "suffix", "potential", "prm",
     }
 )
+
+
+# These contracts are deliberately more specific than the canonical protocol
+# name.  In particular, ``binary_local`` is an exact deterministic verifier
+# label; it is not a Bernoulli-logistic observation and it is not a PRM
+# pseudo-label.  Keeping the semantic object next to protocol normalization
+# lets reward producers, synthetic controls, and audits share one vocabulary
+# instead of inferring a data-generating process from the word "binary".
+_FEEDBACK_PROTOCOL_CONTRACTS: dict[str, dict[str, str]] = {
+    "local_sum": {
+        "family": "aggregate_reward",
+        "label_semantics": "observed_segment_reward",
+        "estimator": "ridge_or_direct_macro",
+        "comparator": "macro_return",
+        "reward_aggregation": "segment_additive_sum",
+        "reward_sign": "caller_defined",
+        "raw_scale": "caller_declared_macro_units",
+        "normalization": "none_by_default",
+    },
+    "utility_delta": {
+        "family": "potential_difference",
+        "label_semantics": "provider_utility_potential",
+        "estimator": "potential_difference",
+        "comparator": "macro_return",
+        "reward_aggregation": "adjacent_potential_difference",
+        "reward_sign": "signed",
+        "raw_scale": "unit_potential_difference",
+        "normalization": "potential_difference_preserves_telescoping",
+    },
+    "prm_potential": {
+        "family": "potential_difference",
+        "label_semantics": "prm_model_derived_pseudo_label",
+        "estimator": "potential_difference",
+        "comparator": "exact_terminal_verifier_diagnostic",
+        "reward_aggregation": "adjacent_potential_difference",
+        "reward_sign": "signed",
+        "raw_scale": "unit_prm_potential_difference",
+        "normalization": "potential_difference_preserves_telescoping",
+    },
+    "terminal": {
+        "family": "sparse_outcome",
+        "label_semantics": "deterministic_terminal_verifier",
+        "estimator": "terminal_outcome",
+        "comparator": "terminal_verifier",
+        "reward_aggregation": "terminal_sparse_anchor",
+        "reward_sign": "verifier_defined",
+        "raw_scale": "verifier_score_units",
+        "normalization": "no_segment_count_rescaling",
+    },
+    "binary_local": {
+        "family": "binary_feedback",
+        "label_semantics": "deterministic_prefix_verifier",
+        "estimator": "logistic_fisher_or_binary_critic",
+        "comparator": "exact_prefix_verifier",
+        "reward_aggregation": "segment_binary_label",
+        "reward_sign": "nonnegative_unit_interval",
+        "raw_scale": "bernoulli_label_units",
+        "normalization": "logistic_latent_and_probability_are_separate",
+    },
+    "mean": {
+        "family": "aggregate_reward",
+        "label_semantics": "observed_segment_mean",
+        "estimator": "ridge_or_direct_macro",
+        "comparator": "macro_return",
+        "reward_aggregation": "segment_mean",
+        "reward_sign": "caller_defined",
+        "raw_scale": "caller_declared_macro_units",
+        "normalization": "segment_mean_explicit",
+        "training_scale": "one_over_realized_segment_count",
+    },
+}
 
 
 def normalize_feedback_protocol(protocol: str) -> str:
@@ -401,6 +773,93 @@ def normalize_feedback_protocol(protocol: str) -> str:
             "expected one of local_sum, utility_delta, prm_potential, terminal, binary_local, mean"
         )
     return aliases.get(protocol, protocol)
+
+
+_POLYSEG_ROLLOUT_ALIASES = {
+    "feedback": "polyseg_feedback",
+    "feature_dim": "polyseg_feature_dim",
+    "segment_cost": "polyseg_segment_cost",
+    "budget": "polyseg_total_budget",
+    "budget_fallback": "polyseg_budget_fallback",
+    "critic_compute_cost": "polyseg_critic_compute_cost",
+    "compute_budget": "polyseg_compute_budget",
+    "q_candidates": "polyseg_q_candidates",
+    "m_candidates": "polyseg_m_candidates",
+    "selector_norm": "polyseg_selector_norm",
+    "adaptive": "polyseg_adaptive",
+}
+
+
+def _config_value(mapping: Any, key: str) -> Any:
+    """Read a config mapping/object without turning missing into a default."""
+    if mapping is None:
+        return None
+    try:
+        value = mapping.get(key, None) if hasattr(mapping, "get") else getattr(mapping, key, None)
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return value
+
+
+def resolve_polyseg_option(
+    config: Any,
+    key: str,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+    rollout_alias: str | None = None,
+    default: Any = None,
+) -> Any:
+    """Resolve one PolySeg option using one precedence contract.
+
+    Explicit reward-manager kwargs win over ``algorithm.polyseg``.  Rollout
+    fields are compatibility aliases used only when neither training-side
+    source supplies a value.  ``None`` means unspecified, which lets a
+    launcher use the algorithm value without a hidden YAML default masking it.
+    """
+    reward_kwargs = _config_value(_config_value(config, "reward"), "reward_kwargs")
+    algorithm = _config_value(config, "algorithm")
+    algorithm_polyseg = _config_value(algorithm, "polyseg")
+    # Read the rollout object separately because both DictConfig and plain
+    # namespaces are used by launchers and unit tests.
+    actor_rollout_ref = _config_value(config, "actor_rollout_ref")
+    rollout = _config_value(actor_rollout_ref, "rollout")
+    if rollout is None:
+        rollout = getattr(actor_rollout_ref, "rollout", None) if actor_rollout_ref is not None else None
+    candidates = [
+        overrides,
+        reward_kwargs,
+        algorithm_polyseg,
+    ]
+    alias = rollout_alias or _POLYSEG_ROLLOUT_ALIASES.get(key)
+    if alias:
+        candidates.append({alias: _config_value(rollout, alias)})
+    candidates.append(rollout)
+    for mapping in candidates:
+        value = _config_value(mapping, key)
+        if value is not None:
+            return value
+        if alias and mapping is not None and _config_value(mapping, alias) is not None:
+            return _config_value(mapping, alias)
+    return default
+
+
+def feedback_protocol_contract(protocol: str) -> dict[str, str]:
+    """Return the explicit statistical semantics for a feedback protocol.
+
+    The returned mapping is a copy so callers may add provenance fields to a
+    per-trajectory record without mutating the global contract.  This helper
+    is intentionally descriptive: it does not turn deterministic verifier
+    labels into Bernoulli samples or make PRM probabilities into correctness
+    labels.  Synthetic Bernoulli-logistic experiments therefore retain their
+    own ``feedback_protocol=bernoulli_logistic`` artifact value.
+    """
+
+    canonical = normalize_feedback_protocol(protocol)
+    try:
+        contract = _FEEDBACK_PROTOCOL_CONTRACTS[canonical]
+    except KeyError as exc:  # pragma: no cover - normalize already guards this
+        raise ValueError(f"no semantic contract for PolySeg protocol {canonical!r}") from exc
+    return {"protocol": canonical, **contract}
 
 
 def decode_token_ids(tokenizer, token_ids: Any, *, skip_special_tokens: bool = True) -> str:
@@ -496,12 +955,17 @@ def extract_segment_metadata(
         padded = torch.full((response_length,), -1, dtype=torch.long)
         padded[: ids.numel()] = ids
         ids = padded
-    else:
-        ids = ids[:response_length]
+    elif ids.numel() > response_length:
+        raise ValueError(
+            "rollout segment_ids must be token-aligned with response_length; "
+            f"got {ids.numel()} IDs for {response_length} response positions"
+        )
     ids[~valid_response_mask.to(torch.bool).cpu()] = -1
     active_ids = ids[valid_response_mask.to(torch.bool).cpu()]
     if active_ids.numel() == 0:
         raise ValueError("rollout segment_ids contain no valid response positions")
+    if torch.any(active_ids < 0):
+        raise ValueError("rollout segment_ids must be non-negative on valid response positions")
 
     # Segment ids must be contiguous for the macro tensors and estimator.  A
     # rollout may use arbitrary ids, so remap in first-occurrence order.
@@ -526,7 +990,27 @@ def extract_segment_metadata(
             else:
                 boundaries.append((int(boundary[0]), int(boundary[1])))
         if len(boundaries) != count:
-            boundaries = [(int(torch.nonzero(ids == j).min()), int(torch.nonzero(ids == j).max()) + 1) for j in range(count)]
+            raise ValueError(
+                "rollout segment_boundaries must contain one span per segment ID"
+            )
+        # Rollout-owned boundaries are causal metadata, not a display hint.
+        # Reject malformed spans instead of allowing a reward manager to fit
+        # features on empty, overlapping, or out-of-range intervals that
+        # disagree with the token-aligned segment IDs.
+        previous_end = 0
+        for segment_id, (start, end) in enumerate(boundaries):
+            if start < 0 or end <= start or end > response_length:
+                raise ValueError(
+                    f"segment boundary {segment_id} is outside response bounds: {(start, end)}"
+                )
+            if segment_id and start < previous_end:
+                raise ValueError("rollout segment boundaries must be non-overlapping and ordered")
+            positions = torch.nonzero(ids == segment_id, as_tuple=False).flatten()
+            if positions.numel() == 0 or int(positions.min()) < start or int(positions.max()) >= end:
+                raise ValueError(
+                    f"segment boundary {segment_id} does not cover its token-aligned segment IDs"
+                )
+            previous_end = end
 
     if raw_durations is None:
         # AgentLoop segments represent one environment/tool transition.  The
@@ -561,7 +1045,12 @@ def compute_segment_rewards(values: Sequence[float], protocol: str) -> list[floa
     if canonical == "terminal":
         return [0.0] * (len(values) - 1) + [values[-1]]
     if canonical == "mean":
-        return values
+        # Mean feedback is an episode-level protocol.  PPO still consumes an
+        # additive macro reward, so distribute the observed episode mean over
+        # the realized segments.  This keeps the training target and
+        # ``episode_reward`` on the same scale for variable segment counts.
+        scale = 1.0 / float(len(values))
+        return [value * scale for value in values]
     raise AssertionError(f"unhandled protocol {canonical}")
 
 
@@ -577,6 +1066,9 @@ def build_segment_features(
     max_duration: float | None = None,
     max_action_tokens: float | None = None,
     max_tool_calls: float = 16.0,
+    state_features: torch.Tensor | np.ndarray | None = None,
+    representation: FrozenLowDimRepresentation | None = None,
+    state_mask: torch.Tensor | np.ndarray | None = None,
 ) -> torch.Tensor:
     """Build the frozen low-dimensional feature map for macro states.
 
@@ -603,6 +1095,43 @@ def build_segment_features(
     duration_scale = max(float(max_duration if max_duration is not None else horizon_scale), 1.0)
     action_scale = max(float(max_action_tokens if max_action_tokens is not None else horizon_scale), 1.0)
     tool_scale = max(float(max_tool_calls), 1.0)
+    if state_features is not None:
+        state = _as_tensor(state_features, dtype=torch.float32)
+        if state.ndim == 2 and state.shape[0] == count:
+            segment_state = state
+        elif state.ndim == 2 and state.shape[0] >= response_length:
+            mask = None if state_mask is None else _as_tensor(state_mask, device=state.device).to(torch.bool).flatten()
+            if mask is not None and mask.numel() < response_length:
+                raise ValueError("state_mask must cover response_length rows")
+            pooled = []
+            for start, end in boundaries:
+                rows = state[int(start): int(end)]
+                if mask is not None:
+                    rows = rows[mask[int(start): int(end)]]
+                if rows.numel() == 0:
+                    raise ValueError("each segment must contain at least one state feature row")
+                pooled.append(rows.mean(0))
+            segment_state = torch.stack(pooled, dim=0)
+        else:
+            raise ValueError("state_features must be [segments,input_dim] or [tokens,input_dim]")
+        # Callers may provide either raw frozen hidden states together with a
+        # serialized representation, or already mapped ``[-1, 1]`` features.
+        # The latter is useful when the representation was applied by a
+        # rollout service.  Raw features still fail closed unless an explicit
+        # representation is supplied, so a changing hidden dimension cannot
+        # silently become a new statistical feature map.
+        if representation is None:
+            if segment_state.shape[1] != feature_dim:
+                raise ValueError(
+                    "state_features require a frozen representation when their width "
+                    "does not equal feature_dim"
+                )
+            mapped = segment_state
+        else:
+            mapped = representation.transform(segment_state)
+        if mapped.shape[1] != feature_dim:
+            raise ValueError("representation output dimension must equal feature_dim")
+        return mapped.to(dtype=torch.float32)
     rows = []
     for index, ((start, end), duration) in enumerate(zip(boundaries, duration_values.tolist(), strict=True)):
         # These scales are caller/configuration supplied, never maxima of the
@@ -618,6 +1147,495 @@ def build_segment_features(
             raw.append(-1.0 + 2.0 * min(float(tool_call_counts[index]) / tool_scale, 1.0))
         rows.append(raw[:feature_dim] + [0.0] * max(0, feature_dim - len(raw)))
     return torch.tensor(rows, dtype=torch.float32)
+
+
+class FrozenLowDimRepresentation:
+    """A fitted, immutable low-dimensional map for PolySeg state features.
+
+    The original PolySeg path uses rollout summaries as a safe fallback.  This
+    class provides the missing representation contract for callers that have
+    frozen LM hidden states or other continuous state/action features.  Mean,
+    scale, projection and output scale are all serialized and fingerprinted;
+    ``transform`` never refits them.
+    """
+
+    VERSION = "polyseg-frozen-lowdim-v1"
+
+    def __init__(
+        self,
+        mean: torch.Tensor,
+        scale: torch.Tensor,
+        projection: torch.Tensor,
+        output_scale: torch.Tensor,
+        *,
+        feature_names: Sequence[str] | None = None,
+    ) -> None:
+        self.mean = _as_tensor(mean, dtype=torch.float32).flatten().detach().cpu()
+        self.scale = _as_tensor(scale, dtype=torch.float32).flatten().detach().cpu()
+        self.projection = _as_tensor(projection, dtype=torch.float32).detach().cpu()
+        self.output_scale = _as_tensor(output_scale, dtype=torch.float32).flatten().detach().cpu()
+        if self.mean.numel() < 1 or self.scale.shape != self.mean.shape:
+            raise ValueError("representation mean and scale must be non-empty and aligned")
+        if self.projection.ndim != 2 or self.projection.shape[0] != self.mean.numel():
+            raise ValueError("representation projection has an invalid input dimension")
+        if self.output_scale.shape != (self.projection.shape[1],):
+            raise ValueError("representation output_scale must match projection output dimension")
+        if not all(torch.isfinite(x).all() for x in (self.mean, self.scale, self.projection, self.output_scale)):
+            raise ValueError("representation parameters must be finite")
+        if torch.any(self.scale <= 0) or torch.any(self.output_scale <= 0):
+            raise ValueError("representation scales must be positive")
+        self.feature_names = tuple(feature_names or [f"z{i}" for i in range(self.dimension)])
+        if len(self.feature_names) != self.dimension or len(set(self.feature_names)) != self.dimension:
+            raise ValueError("representation feature_names must match the output dimension and be unique")
+
+    @property
+    def input_dim(self) -> int:
+        return int(self.mean.numel())
+
+    @property
+    def dimension(self) -> int:
+        return int(self.projection.shape[1])
+
+    @classmethod
+    def fit(
+        cls,
+        samples: torch.Tensor | np.ndarray | Sequence[Sequence[float]],
+        output_dim: int,
+        *,
+        seed: int = 0,
+        feature_names: Sequence[str] | None = None,
+    ) -> "FrozenLowDimRepresentation":
+        """Fit normalization and a deterministic random orthogonal projection."""
+        x = _as_tensor(samples, dtype=torch.float32)
+        if x.ndim != 2 or x.shape[0] < 1 or x.shape[1] < 1:
+            raise ValueError("samples must be a non-empty [N,input_dim] matrix")
+        if output_dim < 1 or output_dim > x.shape[1]:
+            raise ValueError("output_dim must lie in [1, input_dim]")
+        if not torch.isfinite(x).all():
+            raise ValueError("representation samples must be finite")
+        mean = x.mean(0)
+        scale = x.std(0, unbiased=False).clamp_min(1e-6)
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        raw = torch.randn((x.shape[1], output_dim), generator=generator, dtype=torch.float32)
+        projection, _ = torch.linalg.qr(raw, mode="reduced")
+        normalized = (x - mean) / scale
+        projected = normalized @ projection
+        output_scale = projected.abs().amax(0).clamp_min(1.0)
+        return cls(mean, scale, projection, output_scale, feature_names=feature_names)
+
+    @property
+    def fingerprint(self) -> str:
+        payload = self.state_dict()
+        serializable = {
+            key: (value.tolist() if torch.is_tensor(value) else value)
+            for key, value in payload.items()
+        }
+        encoded = json.dumps(serializable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def transform(self, samples: torch.Tensor | np.ndarray | Sequence[Sequence[float]]) -> torch.Tensor:
+        x = _as_tensor(samples, dtype=torch.float32)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        if x.ndim != 2 or x.shape[1] != self.input_dim:
+            raise ValueError("representation samples have the wrong input dimension")
+        z = ((x - self.mean.to(x.device)) / self.scale.to(x.device)) @ self.projection.to(x.device)
+        return (z / self.output_scale.to(z.device)).clamp(-1.0, 1.0)
+
+    def drift(
+        self,
+        reference: torch.Tensor | np.ndarray | Sequence[Sequence[float]],
+        current: torch.Tensor | np.ndarray | Sequence[Sequence[float]],
+    ) -> dict[str, float]:
+        """Measure representation drift between two checkpoints/batches."""
+        before = self.transform(reference)
+        after = self.transform(current)
+        if before.shape != after.shape:
+            raise ValueError("reference and current representation samples must align")
+        norms = (after - before).norm(dim=-1)
+        return {
+            "mean_l2": float(norms.mean()),
+            "max_l2": float(norms.max()),
+            "p95_l2": float(torch.quantile(norms, 0.95)),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.VERSION,
+            "mean": self.mean,
+            "scale": self.scale,
+            "projection": self.projection,
+            "output_scale": self.output_scale,
+            "feature_names": list(self.feature_names),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "FrozenLowDimRepresentation":
+        if state.get("version", cls.VERSION) != cls.VERSION:
+            raise ValueError("unsupported frozen representation version")
+        return cls(
+            state["mean"], state["scale"], state["projection"], state["output_scale"],
+            feature_names=state.get("feature_names"),
+        )
+
+
+def load_frozen_representation(path: str | os.PathLike[str]) -> FrozenLowDimRepresentation:
+    """Load a serialized representation without permitting an implicit refit."""
+    location = Path(path).expanduser()
+    if not location.is_file():
+        raise FileNotFoundError(f"frozen PolySeg representation does not exist: {location}")
+    if location.suffix.lower() == ".json":
+        payload = json.loads(location.read_text())
+    else:
+        payload = torch.load(location, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError("frozen PolySeg representation checkpoint must be a mapping")
+    return FrozenLowDimRepresentation.from_state_dict(payload)
+
+
+def aggregate_step_features(
+    step_features: torch.Tensor,
+    segment_ids_tensor: torch.Tensor,
+    *,
+    num_segments: int | None = None,
+    step_mask: torch.Tensor | None = None,
+    reduction: str = "sum",
+) -> torch.Tensor:
+    """Construct the shared-parameter design Φ_j = Σ_{h in B_j} φ(z_h)."""
+    x = _as_tensor(step_features)
+    ids = _as_tensor(segment_ids_tensor, device=x.device, dtype=torch.long)
+    if x.ndim != 3 or ids.ndim != 2 or x.shape[:2] != ids.shape:
+        raise ValueError("step_features must be [batch,tokens,dim] and segment_ids [batch,tokens]")
+    if num_segments is None:
+        active = ids[ids >= 0]
+        num_segments = int(active.max().item()) + 1 if active.numel() else 0
+    if num_segments < 1:
+        return x.new_zeros((x.shape[0], 0, x.shape[-1]))
+    safe = ids.clamp_min(0)
+    mask = (ids >= 0) if step_mask is None else _as_tensor(step_mask, device=x.device).to(torch.bool)
+    if mask.shape != ids.shape:
+        raise ValueError("step_mask must match segment_ids")
+    if torch.any(ids[mask] < 0):
+        raise ValueError("active step features must have non-negative segment ids")
+    if torch.any(ids[mask] >= num_segments):
+        raise ValueError("segment_ids contain an id outside num_segments")
+    out = x.new_zeros((x.shape[0], num_segments, x.shape[-1]))
+    out.scatter_add_(1, safe.unsqueeze(-1).expand_as(x), torch.where(mask.unsqueeze(-1), x, torch.zeros_like(x)))
+    if reduction == "mean":
+        counts = x.new_zeros((x.shape[0], num_segments, 1))
+        counts.scatter_add_(1, safe.unsqueeze(-1), mask.to(x.dtype).unsqueeze(-1))
+        out = out / counts.clamp_min(1.0)
+    elif reduction != "sum":
+        raise ValueError("reduction must be 'sum' or 'mean'")
+    return out
+
+
+class SharedStepRewardEstimator:
+    """Ridge estimator for the shared step-level reward route."""
+
+    def __init__(self, feature_dim: int, ridge_lambda: float = 1.0, *, q: int | None = None, basis: str = "total", normalized_basis: bool = False) -> None:
+        if feature_dim < 1 or ridge_lambda <= 0 or (q is not None and q < 0):
+            raise ValueError("feature_dim must be positive and ridge_lambda must be positive")
+        if basis not in {"total", "additive"}:
+            raise ValueError("basis must be 'total' or 'additive'")
+        self.input_dim = int(feature_dim)
+        self.q = q
+        self.basis = basis
+        self.normalized_basis = bool(normalized_basis)
+        self.feature_dim = (
+            int(legendre_features(torch.zeros(1, feature_dim), q, basis=basis, normalized=normalized_basis).shape[-1])
+            if q is not None else int(feature_dim)
+        )
+        self.ridge_lambda = float(ridge_lambda)
+        self.gram: torch.Tensor | None = None
+        self.rhs: torch.Tensor | None = None
+        self.theta: torch.Tensor | None = None
+
+    def fit_segment_feedback(
+        self,
+        step_features: torch.Tensor,
+        segment_ids_tensor: torch.Tensor,
+        segment_feedback: torch.Tensor,
+        *,
+        segment_mask: torch.Tensor | None = None,
+        step_mask: torch.Tensor | None = None,
+        accumulate: bool = False,
+    ) -> "SharedStepRewardEstimator":
+        raw = _as_tensor(step_features)
+        if raw.ndim != 3 or raw.shape[-1] != self.input_dim:
+            raise ValueError("step_features do not match the estimator input dimension")
+        design = raw if self.q is None else legendre_features(
+            raw.reshape(-1, raw.shape[-1]), self.q, basis=self.basis, normalized=self.normalized_basis
+        ).reshape(raw.shape[0], raw.shape[1], -1)
+        phi = aggregate_step_features(
+            design,
+            segment_ids_tensor,
+            num_segments=segment_feedback.shape[-1],
+            step_mask=step_mask,
+            reduction="sum",
+        )
+        y = _as_tensor(segment_feedback, device=phi.device)
+        if y.ndim == 1:
+            y = y.unsqueeze(0)
+        mask = torch.ones_like(y, dtype=torch.bool) if segment_mask is None else _as_tensor(segment_mask, device=phi.device).to(torch.bool)
+        if mask.shape != y.shape or phi.shape[:2] != y.shape:
+            raise ValueError("segment feedback and mask must align with aggregated features")
+        x = phi[mask].reshape(-1, self.feature_dim)
+        target = y[mask].reshape(-1)
+        if x.numel() == 0:
+            raise ValueError("cannot fit shared reward estimator without observed feedback")
+        gram = x.T @ x
+        rhs = x.T @ target
+        if accumulate and self.gram is not None:
+            gram, rhs = self.gram.to(x) + gram, self.rhs.to(x) + rhs
+        self.gram, self.rhs = gram.detach(), rhs.detach()
+        eye = torch.eye(self.feature_dim, dtype=x.dtype, device=x.device)
+        self.theta = torch.linalg.solve(gram + self.ridge_lambda * eye, rhs)
+        return self
+
+    def predict_step_rewards(self, step_features: torch.Tensor) -> torch.Tensor:
+        if self.theta is None:
+            raise RuntimeError("shared reward estimator must be fitted before prediction")
+        raw = _as_tensor(step_features)
+        if raw.ndim < 2 or raw.shape[-1] != self.input_dim:
+            raise ValueError("step_features do not match the estimator input dimension")
+        design = raw if self.q is None else legendre_features(
+            raw.reshape(-1, raw.shape[-1]), self.q, basis=self.basis, normalized=self.normalized_basis
+        ).reshape(*raw.shape[:-1], -1)
+        return design @ self.theta.to(design.device)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "input_dim": self.input_dim, "feature_dim": self.feature_dim, "q": self.q,
+            "basis": self.basis, "normalized_basis": self.normalized_basis,
+            "ridge_lambda": self.ridge_lambda, "gram": self.gram, "rhs": self.rhs, "theta": self.theta,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> "SharedStepRewardEstimator":
+        if state.get("feature_dim", self.feature_dim) != self.feature_dim or state.get("input_dim", self.input_dim) != self.input_dim:
+            raise ValueError("shared reward feature dimension does not match")
+        if "q" in state and state["q"] != self.q:
+            raise ValueError("shared reward polynomial order does not match")
+        if "basis" in state and state["basis"] != self.basis:
+            raise ValueError("shared reward basis does not match")
+        if "normalized_basis" in state and bool(state["normalized_basis"]) != self.normalized_basis:
+            raise ValueError("shared reward normalized-basis setting does not match")
+        if "ridge_lambda" in state:
+            value = float(state["ridge_lambda"])
+            if not math.isfinite(value) or value <= 0 or not math.isclose(value, self.ridge_lambda, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("shared reward ridge regularization does not match")
+        self.gram = None if state.get("gram") is None else _as_tensor(state["gram"])
+        self.rhs = None if state.get("rhs") is None else _as_tensor(state["rhs"])
+        self.theta = None if state.get("theta") is None else _as_tensor(state["theta"])
+        if self.gram is not None and (self.gram.shape != (self.feature_dim, self.feature_dim) or not torch.isfinite(self.gram).all()):
+            raise ValueError("invalid shared reward Gram matrix")
+        if self.rhs is not None and (self.rhs.shape != (self.feature_dim,) or not torch.isfinite(self.rhs).all()):
+            raise ValueError("invalid shared reward right-hand side")
+        if self.theta is not None and not torch.isfinite(self.theta).all():
+            raise ValueError("non-finite shared reward parameter vector")
+        if self.theta is not None and self.theta.shape != (self.feature_dim,):
+            raise ValueError("invalid shared reward parameter vector")
+        return self
+
+
+def recover_step_rewards_from_segment_feedback(
+    step_features: torch.Tensor,
+    segment_ids_tensor: torch.Tensor,
+    segment_feedback: torch.Tensor,
+    *,
+    ridge_lambda: float = 1.0,
+    segment_mask: torch.Tensor | None = None,
+    step_mask: torch.Tensor | None = None,
+    q: int | None = None,
+    basis: str = "total",
+    normalized_basis: bool = False,
+) -> tuple[torch.Tensor, SharedStepRewardEstimator]:
+    """Fit shared reward parameters and return one recovered reward per step."""
+    estimator = SharedStepRewardEstimator(
+        step_features.shape[-1], ridge_lambda, q=q, basis=basis, normalized_basis=normalized_basis
+    )
+    estimator.fit_segment_feedback(
+        step_features,
+        segment_ids_tensor,
+        segment_feedback,
+        segment_mask=segment_mask,
+        step_mask=step_mask,
+    )
+    return estimator.predict_step_rewards(step_features), estimator
+
+
+def dependence_confidence_radius(
+    *,
+    dimension: int,
+    effective_samples: float,
+    delta: float = 0.05,
+    kappa_segment: float = 1.0,
+    kappa_trajectory: float = 1.0,
+    sigma: float = 1.0,
+    bound: float = 1.0,
+) -> float:
+    """Compute an explicit finite-sample dependence-aware radius."""
+    if dimension < 1 or effective_samples <= 0 or not 0 < delta < 1:
+        raise ValueError("dimension/effective_samples must be positive and delta must lie in (0,1)")
+    if min(kappa_segment, kappa_trajectory, sigma, bound) < 0:
+        raise ValueError("dependence radius parameters must be non-negative")
+    neff = effective_samples / max(kappa_segment * kappa_trajectory, 1.0)
+    log_term = math.log(max(2.0 * dimension / delta, 1.0000001))
+    return float(sigma * math.sqrt(2.0 * log_term / neff) + 3.0 * bound * log_term / neff)
+
+
+def bellman_closure_residual(
+    macro_rewards: torch.Tensor,
+    successor_values: torch.Tensor,
+    fitted_bellman_values: torch.Tensor,
+    *,
+    mask: torch.Tensor | None = None,
+    gamma: float = 1.0,
+    durations: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the empirical ζ residual for a fitted macro Bellman class."""
+    r = _as_tensor(macro_rewards)
+    nxt = _as_tensor(successor_values, device=r.device)
+    fit = _as_tensor(fitted_bellman_values, device=r.device)
+    if r.shape != nxt.shape or r.shape != fit.shape:
+        raise ValueError("Bellman inputs must have identical shapes")
+    d = torch.ones_like(r) if durations is None else _as_tensor(durations, device=r.device)
+    if d.shape != r.shape:
+        raise ValueError("durations must match Bellman inputs")
+    residual = (r + torch.pow(torch.as_tensor(gamma, dtype=r.dtype, device=r.device), d) * nxt - fit).abs()
+    if mask is not None:
+        valid = _as_tensor(mask, device=r.device).to(torch.bool)
+        if valid.shape != r.shape:
+            raise ValueError("mask must match Bellman inputs")
+        residual = residual[valid]
+    return residual.max() if residual.numel() else r.new_zeros(())
+
+
+def segment_comparator_regret(comparator_values: torch.Tensor | Sequence[float], policy_values: torch.Tensor | Sequence[float]) -> torch.Tensor:
+    """Compute empirical regret against a supplied macro comparator."""
+    comparator = _as_tensor(comparator_values)
+    policy = _as_tensor(policy_values, device=comparator.device)
+    if comparator.shape != policy.shape:
+        raise ValueError("comparator and policy values must have the same shape")
+    return (comparator - policy).clamp_min(0).sum()
+
+
+def budget_comparator_regret(comparator_values: torch.Tensor | Sequence[float], policy_values: torch.Tensor | Sequence[float]) -> torch.Tensor:
+    return segment_comparator_regret(comparator_values, policy_values)
+
+
+def compression_gap(step_optimal_values: torch.Tensor | Sequence[float], segment_optimal_values: torch.Tensor | Sequence[float]) -> torch.Tensor:
+    """Compute the observed step-vs-segment comparator restriction gap."""
+    step = _as_tensor(step_optimal_values)
+    segment = _as_tensor(segment_optimal_values, device=step.device)
+    if step.shape != segment.shape:
+        raise ValueError("step and segment comparator values must have the same shape")
+    return (step - segment).clamp_min(0).sum()
+
+
+def full_step_comparator_regret(
+    segment_regret: float | torch.Tensor,
+    step_optimal_values: torch.Tensor | Sequence[float],
+    segment_optimal_values: torch.Tensor | Sequence[float],
+) -> torch.Tensor:
+    """Decompose full-step regret into macro regret plus compression gap."""
+    macro = _as_tensor(segment_regret)
+    return macro + compression_gap(step_optimal_values, segment_optimal_values)
+
+
+def budget_feasible_segments(
+    *,
+    episodes: int,
+    horizon: int,
+    budget: float | None,
+    segment_cost: float = 1.0,
+) -> int:
+    """Return m_B(K) for a fixed per-segment query cost."""
+    if episodes < 1 or horizon < 1 or segment_cost <= 0:
+        raise ValueError("episodes/horizon must be positive and segment_cost must be positive")
+    if budget is None:
+        return int(horizon)
+    if budget < 0 or not math.isfinite(float(budget)):
+        raise ValueError("budget must be finite and non-negative")
+    return min(int(horizon), int(math.floor(float(budget) / (episodes * segment_cost))))
+
+
+def unified_regret_bound(
+    *,
+    episodes: int,
+    horizon: int,
+    q: int,
+    m: int,
+    feature_dim: int,
+    dependence_kappa_segment: float = 1.0,
+    dependence_kappa_trajectory: float = 1.0,
+    feedback_factor: float = 1.0,
+    bellman_error: float = 0.0,
+    compression_error: float = 0.0,
+    feedback_error: float = 0.0,
+    comparator_gap: float = 0.0,
+    stat_constant: float = 1.0,
+) -> dict[str, float]:
+    """Evaluate the unified empirical/theoretical regret decomposition.
+
+    This is a bound calculator, not a proof: users must supply valid smoothness,
+    coverage and dependence constants for the returned value to have theorem
+    semantics.
+    """
+    if episodes < 1 or horizon < 1 or q < 0 or not 1 <= m <= horizon or feature_dim < 1:
+        raise ValueError("invalid regret-bound dimensions")
+    if min(dependence_kappa_segment, dependence_kappa_trajectory, feedback_factor, stat_constant) < 0:
+        raise ValueError("regret-bound constants must be non-negative")
+    dimension = q + 1 if feature_dim == 1 else math.comb(feature_dim + q, feature_dim)
+    statistical = stat_constant * feedback_factor * dimension * math.sqrt(
+        episodes * m * max(dependence_kappa_segment, 1.0) * max(dependence_kappa_trajectory, 1.0)
+    )
+    total = statistical + episodes * (
+        max(float(bellman_error), 0.0)
+        + max(float(compression_error), 0.0)
+        + max(float(feedback_error), 0.0)
+        + max(float(comparator_gap), 0.0)
+    )
+    return {
+        "statistical": float(statistical),
+        "bellman": float(episodes * max(float(bellman_error), 0.0)),
+        "compression": float(episodes * max(float(compression_error), 0.0)),
+        "feedback": float(episodes * max(float(feedback_error), 0.0)),
+        "comparator": float(episodes * max(float(comparator_gap), 0.0)),
+        "total": float(total),
+        "feature_dimension": float(dimension),
+    }
+
+
+class PolySegRegretTracker:
+    """Serializable empirical comparator and budget accounting tracker."""
+
+    def __init__(self) -> None:
+        self.segment_regret = 0.0
+        self.budget_regret = 0.0
+        self.compression_gap = 0.0
+        self.episodes = 0
+
+    def update(self, *, comparator_value: float, policy_value: float, budget_comparator_value: float | None = None, step_optimal_value: float | None = None, segment_optimal_value: float | None = None) -> None:
+        self.segment_regret += max(float(comparator_value) - float(policy_value), 0.0)
+        self.budget_regret += max(float(budget_comparator_value if budget_comparator_value is not None else comparator_value) - float(policy_value), 0.0)
+        if step_optimal_value is not None and segment_optimal_value is not None:
+            self.compression_gap += max(float(step_optimal_value) - float(segment_optimal_value), 0.0)
+        self.episodes += 1
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"segment_regret": self.segment_regret, "budget_regret": self.budget_regret, "compression_gap": self.compression_gap, "episodes": self.episodes}
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "PolySegRegretTracker":
+        obj = cls()
+        for name in ("segment_regret", "budget_regret", "compression_gap"):
+            value = float(state.get(name, 0.0))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid regret tracker {name}")
+            setattr(obj, name, value)
+        obj.episodes = _strict_nonnegative_int(state.get("episodes", 0), "regret tracker episodes")
+        return obj
 
 
 def cross_fitted_segment_residuals(
@@ -726,6 +1744,74 @@ def cross_fitted_logistic_segment_residuals(
     return residuals
 
 
+def _cross_fitted_ragged_residuals(
+    feature_rows: Sequence[np.ndarray],
+    target_rows: Sequence[np.ndarray],
+    *,
+    binary: bool,
+    ridge_lambda: float = 1.0,
+    logistic_l2: float = 1.0,
+    max_iter: int = 50,
+) -> list[np.ndarray]:
+    """Fit trajectory-held-out residuals for variable-length histories.
+
+    A persistent history can contain batches with different ``m`` values, so
+    the rectangular public helpers cannot represent it without padding. This
+    ragged implementation keeps complete trajectory clusters and is used only
+    by the cross-batch diagnostic path.
+    """
+    if not feature_rows or len(feature_rows) != len(target_rows):
+        raise ValueError("ragged OOF inputs must be nonempty and aligned")
+    dimension = int(feature_rows[0].shape[-1])
+    if dimension < 1:
+        raise ValueError("ragged OOF feature dimension must be positive")
+    for x, y in zip(feature_rows, target_rows, strict=True):
+        if x.ndim != 2 or x.shape[1] != dimension or y.ndim != 1 or x.shape[0] != y.shape[0] or x.shape[0] == 0:
+            raise ValueError("ragged OOF rows have incompatible shapes")
+        if not np.isfinite(x).all() or not np.isfinite(y).all():
+            raise ValueError("ragged OOF rows must be finite")
+    if binary and (
+        np.any(np.concatenate(target_rows) < 0)
+        or np.any(np.concatenate(target_rows) > 1)
+    ):
+        raise ValueError("logistic targets must lie in [0, 1]")
+    if ridge_lambda <= 0 or logistic_l2 <= 0 or max_iter < 1:
+        raise ValueError("regularization must be positive and max_iter must be positive")
+
+    def sigmoid(logits: np.ndarray) -> np.ndarray:
+        clipped = np.clip(logits, -60.0, 60.0)
+        return 1.0 / (1.0 + np.exp(-clipped))
+
+    residual_rows: list[np.ndarray] = []
+    for held_out, (test_x, test_y) in enumerate(zip(feature_rows, target_rows, strict=True)):
+        train_x = np.concatenate(
+            [row for index, row in enumerate(feature_rows) if index != held_out], axis=0
+        )
+        train_y = np.concatenate(
+            [row for index, row in enumerate(target_rows) if index != held_out], axis=0
+        )
+        if train_x.shape[0] == 0:
+            prediction = np.full(test_y.shape, 0.5 if binary else 0.0, dtype=np.float64)
+        elif binary:
+            theta = np.zeros(dimension, dtype=np.float64)
+            for _ in range(int(max_iter)):
+                probs = sigmoid(train_x @ theta)
+                curvature = probs * (1.0 - probs)
+                hessian = train_x.T @ (train_x * curvature[:, None]) + logistic_l2 * np.eye(dimension)
+                gradient = train_x.T @ (probs - train_y) + logistic_l2 * theta
+                step = np.linalg.solve(hessian, gradient)
+                theta -= step
+                if float(np.max(np.abs(step))) < 1e-7:
+                    break
+            prediction = sigmoid(test_x @ theta)
+        else:
+            gram = train_x.T @ train_x + ridge_lambda * np.eye(dimension)
+            theta = np.linalg.solve(gram, train_x.T @ train_y)
+            prediction = test_x @ theta
+        residual_rows.append(test_y - prediction)
+    return residual_rows
+
+
 def _dependence_covariance(x: np.ndarray) -> np.ndarray:
     """Stable covariance for a nonempty ``[observations, dimension]`` array."""
     if x.ndim != 2 or x.shape[0] == 0:
@@ -743,6 +1829,53 @@ def _largest_regularized_eigen(base: np.ndarray, long_run: np.ndarray, ridge: fl
     return float(np.max(np.linalg.eigvalsh((normalized + normalized.T) / 2.0)))
 
 
+def _missing_dependence_diagnostics(
+    *,
+    reason: str,
+    dimension: int,
+    hac_lag: int = 0,
+) -> dict[str, Any]:
+    """Return an explicit finite fallback when no feedback rows are usable.
+
+    A budget-exhausted batch can carry structural segment metadata while all
+    of its labels are missing.  Such rows must not be represented as observed
+    zero residuals, and they cannot support a dependence estimate.  The
+    numerical values below keep downstream logging/checkpoint schemas finite;
+    callers must use ``dependence_available`` before treating them as an
+    estimate.
+    """
+
+    return {
+        "dependence_available": False,
+        "dependence_missing_reason": str(reason),
+        "kappa_segment_by_m": {},
+        "kappa_segment": 1.0,
+        "kappa_trajectory": 1.0,
+        "nominal_observations": 0,
+        "cluster_count": 0,
+        "total_observation_weight": 0.0,
+        "weighted_ess_ratio": 0.0,
+        "effective_samples": 0.0,
+        "weighted_effective_samples": 0.0,
+        "segment_acf": [],
+        "trajectory_acf": [],
+        "kappa_segment_upper": 1.0,
+        "kappa_segment_lower": 1.0,
+        "kappa_segment_upper_by_m": {},
+        "kappa_trajectory_upper": 1.0,
+        "kappa_trajectory_lower": 1.0,
+        "chi_hat": 0.0,
+        "hac_lag": int(max(hac_lag, 0)),
+        "iid_cluster_radius_ratio": 1.0,
+        "iid_cluster_radius_ratio_upper": 1.0,
+        "trajectory_count": 0,
+        "segment_count": 0,
+        "bootstrap_samples": 0,
+        "bootstrap_ci": {"segment": [1.0, 1.0], "trajectory": [1.0, 1.0]},
+        "dimension": int(dimension),
+    }
+
+
 def _estimate_dependence_once(
     score_trajectories: list[np.ndarray],
     weights: list[np.ndarray],
@@ -750,6 +1883,30 @@ def _estimate_dependence_once(
     hac_lag: int,
     ridge: float,
 ) -> dict[str, Any]:
+    # Callers normally remove fully masked trajectories before reaching this
+    # helper, but bootstrap/history paths can supply ragged rows directly.
+    # Normalize that input here as well so an empty row cannot make
+    # ``max_m == 0`` and later produce a misleading ``kappa_by_m[0]`` lookup.
+    if len(score_trajectories) != len(weights):
+        raise ValueError("score trajectories and weights must have the same length")
+    nonempty = [
+        (row, weight)
+        for row, weight in zip(score_trajectories, weights, strict=True)
+        if row.shape[0] > 0
+    ]
+    if not nonempty:
+        dimension = (
+            int(score_trajectories[0].shape[1])
+            if score_trajectories and score_trajectories[0].ndim == 2
+            else 1
+        )
+        return _missing_dependence_diagnostics(
+            reason="no_valid_observations",
+            dimension=dimension,
+            hac_lag=hac_lag,
+        )
+    score_trajectories = [row for row, _ in nonempty]
+    weights = [weight for _, weight in nonempty]
     dimension = score_trajectories[0].shape[1]
     max_m = max((row.shape[0] for row in score_trajectories), default=1)
     observations = np.concatenate(score_trajectories, axis=0) if score_trajectories else np.zeros((1, dimension))
@@ -802,11 +1959,29 @@ def _estimate_dependence_once(
     weighted_clusters = np.stack([row_w @ row_s for row_w, row_s in zip(weights, score_trajectories, strict=True)], axis=0)
     weighted_variance = float(np.square(weighted_clusters - weighted_clusters.mean(axis=0)).sum())
     sigma0 = float(np.trace(gamma0))
-    weighted_ess = float(np.clip(total_weight**2 * max(sigma0, ridge) / max(weighted_variance, ridge), 1.0, total_weight))
+    nominal_observations = int(sum(row.shape[0] for row in score_trajectories))
+    # The estimand is a weighted observation mean.  Kish-style scaling must
+    # cancel under ``w -> c w``; using an absolute ridge or clipping by total
+    # weight would make the reported ESS depend on the unit of duration.
+    if sigma0 <= 0.0 or weighted_variance <= 0.0 or nominal_observations <= 0:
+        weighted_ess = float(max(nominal_observations, 1))
+    else:
+        weighted_ess = float(total_weight**2 * sigma0 / weighted_variance)
+        weighted_ess = float(np.clip(weighted_ess, 1.0, float(nominal_observations)))
     return {
         "kappa_segment_by_m": kappa_by_m,
         "kappa_segment": kappa_by_m[max_m],
         "kappa_trajectory": kappa_tr,
+        # Keep the observation measure explicit.  ``effective_samples`` is
+        # the dependence-adjusted nominal segment count; weighted ESS is a
+        # separate estimand based on the supplied segment weights.
+        "nominal_observations": nominal_observations,
+        "cluster_count": int(len(score_trajectories)),
+        "total_observation_weight": total_weight,
+        # Report the effective weighted observations as a fraction of the
+        # nominal observation rows.  This ratio is also invariant to the
+        # unit used for duration weights.
+        "weighted_ess_ratio": float(weighted_ess / nominal_observations) if nominal_observations > 0 else 0.0,
         "effective_samples": float(sum(row.shape[0] for row in score_trajectories) / max(kappa_by_m[max_m] * kappa_tr, 1e-12)),
         "weighted_effective_samples": weighted_ess,
         "segment_acf": acf,
@@ -864,10 +2039,39 @@ def estimate_dependence_diagnostics(
         keep = mask.astype(bool)
         filtered_scores.append(row[keep])
         filtered_weights.append(np.maximum(weight[keep], 0.0))
+    # Fully masked trajectories are absent observations, rather than
+    # zero-valued trajectories.  Remove them before estimating HAC or
+    # resampling complete trajectory clusters.  In particular, this prevents
+    # budget exhaustion from producing max_m=0 and a fabricated dependence
+    # estimate.
+    nonempty = [
+        (score_row, weight_row)
+        for score_row, weight_row in zip(filtered_scores, filtered_weights, strict=True)
+        if score_row.shape[0] > 0
+    ]
+    if not nonempty:
+        return _missing_dependence_diagnostics(
+            reason="no_valid_observations",
+            dimension=dimension,
+            hac_lag=0 if hac_lag is None else int(hac_lag),
+        )
+    filtered_scores = [pair[0] for pair in nonempty]
+    filtered_weights = [pair[1] for pair in nonempty]
     if hac_lag is None:
         hac_lag = max(1, int(math.sqrt(max(row.shape[0] for row in filtered_scores))))
     hac_lag = max(0, int(hac_lag))
     estimate = _estimate_dependence_once(filtered_scores, filtered_weights, hac_lag=hac_lag, ridge=ridge)
+    # ``_estimate_dependence_once`` is defensive, but keep the public result
+    # explicit if a future change reintroduces an empty bootstrap input.
+    if not estimate.get("dependence_available", True):
+        estimate.update(
+            {
+                "hac_lag": int(hac_lag),
+                "trajectory_count": len(filtered_scores),
+                "segment_count": int(sum(row.shape[0] for row in filtered_scores)),
+            }
+        )
+        return estimate
     kappa_values, kappa_tr_values = [], []
     kappa_grid_values: dict[int, list[float]] = {int(m): [] for m in estimate["kappa_segment_by_m"]}
     rng = np.random.default_rng(seed)
@@ -903,6 +2107,7 @@ def estimate_dependence_diagnostics(
     beta = np.polyfit(*zip(*grid), 1)[0] if len(grid) >= 2 else 0.0
     estimate.update(
         {
+            "dependence_available": True,
             "kappa_segment_upper": seg_upper,
             "kappa_segment_lower": seg_lower,
             "kappa_segment_upper_by_m": kappa_grid_upper,
@@ -932,41 +2137,88 @@ def _polyseg_dependence_metrics(
     ridge_lambda: float,
     binary: bool = False,
     logistic_l2: float = 1.0,
+    weight_policy: str = "unit",
+    history_state: PolynomialEstimatorState | None = None,
+    persistent_history: bool = False,
 ) -> dict[str, Any]:
     """Build dependence diagnostics from cross-fitted polynomial score residuals."""
+    weight_policy = str(weight_policy).strip().lower()
+    if weight_policy not in {"unit", "segment_duration"}:
+        raise ValueError("weight_policy must be 'unit' or 'segment_duration'")
     design = legendre_features(features.reshape(-1, features.shape[-1]), q, basis=basis).reshape(
         features.shape[0], features.shape[1], -1
     )
-    residuals = (
-        cross_fitted_logistic_segment_residuals(
-            design,
-            targets,
-            valid_mask=valid,
-            logistic_l2=logistic_l2,
-        )
-        if binary
-        else cross_fitted_segment_residuals(
-            design,
-            targets,
-            valid_mask=valid,
-            ridge_lambda=ridge_lambda,
-        )
-    )
-    score = design.detach().cpu().numpy() * residuals[..., None]
     duration_rows = (
         np.ones(targets.shape, dtype=np.float64)
-        if durations is None
+        if weight_policy == "unit" or durations is None
         else np.asarray(durations.detach().cpu() if torch.is_tensor(durations) else durations, dtype=np.float64)
     )
     if duration_rows.ndim == 1:
         duration_rows = np.broadcast_to(duration_rows[None, :], targets.shape)
-    diagnostics = estimate_dependence_diagnostics(score, valid_mask=valid, weights=duration_rows)
-    valid_trajectories = np.asarray(valid.detach().cpu(), dtype=bool).any(axis=1)
-    diagnostics["diagnostic_oof"] = float(valid_trajectories.sum() >= 2)
+    design_np = design.detach().cpu().numpy()
+    targets_np = targets.detach().cpu().numpy()
+    valid_np = valid.detach().cpu().numpy().astype(bool)
+    if persistent_history and history_state is not None and history_state.dependence_history:
+        history_features = [item["features"].numpy() for item in history_state.dependence_history]
+        history_targets = [item["targets"].numpy() for item in history_state.dependence_history]
+        current_features = [design_np[row][valid_np[row]] for row in range(design_np.shape[0]) if valid_np[row].any()]
+        current_targets = [targets_np[row][valid_np[row]] for row in range(targets_np.shape[0]) if valid_np[row].any()]
+        # Strictly prequential semantics: each current trajectory is held out
+        # against the previous history only. Other trajectories from the same
+        # batch must not become training rows before the policy update.
+        residual_rows = []
+        for current_x, current_y in zip(current_features, current_targets, strict=True):
+            residual_rows.append(
+                _cross_fitted_ragged_residuals(
+                    history_features + [current_x],
+                    history_targets + [current_y],
+                    binary=binary,
+                    ridge_lambda=ridge_lambda,
+                    logistic_l2=logistic_l2,
+                )[-1]
+            )
+        residuals = np.zeros_like(targets_np, dtype=np.float64)
+        current_index = 0
+        for row in range(design_np.shape[0]):
+            if valid_np[row].any():
+                residuals[row, valid_np[row]] = residual_rows[current_index]
+                current_index += 1
+        prior_scores = [item["scores"].numpy() for item in history_state.dependence_history]
+        prior_weights = [item["weights"].numpy() for item in history_state.dependence_history]
+        current_scores = [design_np[row][valid_np[row]] * residuals[row, valid_np[row], None] for row in range(design_np.shape[0]) if valid_np[row].any()]
+        current_weights = [duration_rows[row][valid_np[row]] for row in range(design_np.shape[0]) if valid_np[row].any()]
+        score_rows = prior_scores + current_scores
+        weight_rows = prior_weights + current_weights
+        diagnostics = estimate_dependence_diagnostics(score_rows, weights=weight_rows)
+        diagnostics["diagnostic_oof"] = 1.0
+        diagnostics["dependence_oof_mode"] = "persistent_prequential_history"
+    else:
+        residuals = (
+            cross_fitted_logistic_segment_residuals(
+                design,
+                targets,
+                valid_mask=valid,
+                logistic_l2=logistic_l2,
+            )
+            if binary
+            else cross_fitted_segment_residuals(
+                design,
+                targets,
+                valid_mask=valid,
+                ridge_lambda=ridge_lambda,
+            )
+        )
+        score = design_np * residuals[..., None]
+        diagnostics = estimate_dependence_diagnostics(score, valid_mask=valid, weights=duration_rows)
+        valid_trajectories = valid_np.any(axis=1)
+        diagnostics["diagnostic_oof"] = float(valid_trajectories.sum() >= 2)
+        diagnostics["dependence_oof_mode"] = "batch_cross_fit"
     diagnostics["dependence_score_model"] = "logistic_fisher_score" if binary else "ridge_residual_score"
+    diagnostics["weight_policy"] = weight_policy
     diagnostics["residual_rms"] = float(
-        np.sqrt(np.mean(residuals[np.asarray(valid.detach().cpu(), dtype=bool)] ** 2))
+        np.sqrt(np.mean(residuals[valid_np] ** 2)) if valid_np.any() else 0.0
     )
+    diagnostics["oof_residuals"] = residuals
     return diagnostics
 
 
@@ -981,6 +2233,10 @@ class PolySegConfig:
     basis: str = "total"
     normalized_basis: bool = False
     feedback: str = "sum"
+    # ``macro`` is the direct macro-MDP estimator.  ``shared_step`` enables
+    # the identifiable shared-parameter route from detailed_methods.md and
+    # requires rollout-provided frozen per-step features.
+    reward_route: str = "macro"
     ridge_lambda: float = 1.0
     logistic_l2: float = 1.0
     gamma: float = 1.0
@@ -1017,6 +2273,9 @@ class PolySegConfig:
     use_confidence_bonus: bool = False
     reward_confidence_beta: float = 1.0
     transition_confidence_beta: float = 1.0
+    confidence_delta: float = 0.05
+    use_formal_confidence_radius: bool = False
+    bellman_closure_tolerance: float = 0.0
     # Fit a macro transition operator from adjacent segment-boundary
     # features and use it for the Bellman target.  This is disabled by
     # default because ordinary LLM rollouts do not expose an environment
@@ -1030,8 +2289,27 @@ class PolySegConfig:
     # is the default for variable-length agentic trajectories and leaves the
     # fixed single-turn protocol unchanged because its durations are one.
     critic_weighting: str = "duration"
+    # Prior trajectory clusters retained for prequential OOF dependence
+    # diagnostics when accumulating estimator state.
+    dependence_history_limit: int = 128
+    # Independent checkpointable identity for confidence/dependence state.
+    # Empty derives a run-local identity from estimator_state_id.
+    dependence_state_id: str = ""
 
     def __post_init__(self):
+        for name in ("normalized_basis", "use_kl_in_reward", "normalize_advantages", "use_polynomial_critic", "accumulate_estimator", "use_confidence_bonus", "use_formal_confidence_radius", "use_transition_estimator"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        _strict_int(self.q, "q", minimum=0)
+        _strict_int(self.m, "m", minimum=1)
+        _strict_int(self.feature_dim, "feature_dim", minimum=1)
+        if self.feature_horizon is not None:
+            _strict_int(self.feature_horizon, "feature_horizon", minimum=1)
+        _strict_int(self.horizon, "horizon", minimum=0)
+        _strict_int(self.mlp_hidden_dim, "mlp_hidden_dim", minimum=1)
+        _strict_int(self.mlp_steps, "mlp_steps", minimum=1)
+        _strict_int(self.transition_backup_iterations, "transition_backup_iterations", minimum=1)
+        _strict_int(self.dependence_history_limit, "dependence_history_limit", minimum=0)
         if self.q < 0:
             raise ValueError("q must be non-negative")
         if self.m < 1:
@@ -1046,6 +2324,12 @@ class PolySegConfig:
             "local_sum", "binary_local", "utility_delta", "prm_potential", "terminal", "mean"
         }:
             raise ValueError("unsupported PolySeg feedback protocol")
+        if self.reward_route not in {"macro", "shared_step"}:
+            raise ValueError("reward_route must be 'macro' or 'shared_step'")
+        if not 0.0 < float(self.confidence_delta) < 1.0:
+            raise ValueError("confidence_delta must lie in (0, 1)")
+        if self.bellman_closure_tolerance < 0 or not math.isfinite(float(self.bellman_closure_tolerance)):
+            raise ValueError("bellman_closure_tolerance must be finite and non-negative")
         if not 0 <= self.dependence_chi <= 1:
             raise ValueError("dependence_chi must be in [0, 1]")
         if self.segment_cost <= 0:
@@ -1068,6 +2352,8 @@ class PolySegConfig:
             raise ValueError("invalid MLP critic configuration")
         if not isinstance(self.estimator_state_id, str):
             raise ValueError("estimator_state_id must be a string")
+        if not isinstance(self.dependence_state_id, str):
+            raise ValueError("dependence_state_id must be a string")
         if self.accumulate_estimator and self.critic_type != "polynomial":
             raise ValueError("accumulate_estimator currently requires critic_type='polynomial'")
         if self.accumulate_estimator and normalize_feedback_protocol(self.feedback) == "binary_local":
@@ -1082,6 +2368,8 @@ class PolySegConfig:
             raise ValueError("transition_backup_iterations must be positive")
         if self.critic_weighting not in {"uniform", "duration"}:
             raise ValueError("critic_weighting must be 'uniform' or 'duration'")
+        if int(self.dependence_history_limit) < 0:
+            raise ValueError("dependence_history_limit must be non-negative")
         if self.use_transition_estimator and not self.use_polynomial_critic:
             raise ValueError("use_transition_estimator requires use_polynomial_critic")
 
@@ -1163,19 +2451,30 @@ class BudgetedPolySegController:
         segment_cost: float = 1.0,
         **bound_kwargs: Any,
     ):
+        _strict_real(segment_cost, "segment_cost", strictly_positive=True)
         if not math.isfinite(segment_cost) or segment_cost <= 0:
             raise ValueError("segment_cost must be finite and positive")
-        self.q_candidates = tuple(sorted(set(int(q) for q in q_candidates)))
-        self.m_candidates = tuple(sorted(set(int(m) for m in m_candidates)))
+        parsed_q = [_strict_nonnegative_int(q, "q candidate") for q in q_candidates]
+        parsed_m = [_strict_nonnegative_int(m, "m candidate") for m in m_candidates]
+        self.q_candidates = tuple(sorted(set(parsed_q)))
+        self.m_candidates = tuple(sorted(set(parsed_m)))
         if not self.q_candidates or not self.m_candidates:
             raise ValueError("q_candidates and m_candidates must be non-empty")
         if any(q < 0 for q in self.q_candidates) or any(m < 1 for m in self.m_candidates):
             raise ValueError("q candidates must be non-negative and m candidates positive")
-        self.total_budget = None if total_budget is None else float(total_budget)
+        self.total_budget = None if total_budget is None else _strict_real(total_budget, "total_budget")
         if self.total_budget is not None and (not math.isfinite(self.total_budget) or self.total_budget < 0):
             raise ValueError("total_budget must be finite and non-negative")
         self.segment_cost = float(segment_cost)
         self.bound_kwargs = dict(bound_kwargs)
+        # Checkpointed selector bounds are trusted configuration, not data to
+        # be silently repaired.  Reject non-finite numeric values before they
+        # can reach the candidate search.
+        for name, value in self.bound_kwargs.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+                raise ValueError(f"controller bound {name} must be finite")
         self.critic_compute_cost = float(self.bound_kwargs.pop("critic_compute_cost", 0.0))
         if not math.isfinite(self.critic_compute_cost) or self.critic_compute_cost < 0:
             raise ValueError("critic_compute_cost must be finite and non-negative")
@@ -1360,16 +2659,31 @@ class BudgetedPolySegController:
         )
         controller.consumed_budget = float(state.get("consumed_budget", 0.0))
         controller.consumed_compute_budget = float(state.get("consumed_compute_budget", 0.0))
-        controller.episodes = int(state.get("episodes", 0))
+        controller.episodes = _strict_nonnegative_int(state.get("episodes", 0), "controller episodes")
         controller.selector_norm = str(state.get("selector_norm", controller.selector_norm)).strip().lower()
+        if (
+            not math.isfinite(controller.consumed_budget)
+            or controller.consumed_budget < 0
+            or not math.isfinite(controller.consumed_compute_budget)
+            or controller.consumed_compute_budget < 0
+            or controller.episodes < 0
+        ):
+            raise ValueError("invalid controller counters")
+        if controller.selector_norm not in {"power", "effective_round", "segment_update"}:
+            raise ValueError("invalid controller selector_norm")
         controller.budget_fallback = str(state.get("budget_fallback", controller.budget_fallback)).strip().lower()
         if controller.budget_fallback not in {"error", "skip"}:
             raise ValueError("invalid controller budget_fallback")
-        controller.kappa_segment_upper_by_m = {
-            int(key): min(max(float(value), 1.0), float(int(key)))
-            for key, value in dict(state.get("kappa_segment_upper_by_m", {})).items()
-            if int(key) >= 1 and math.isfinite(float(value))
-        }
+        raw_m_bounds = state.get("kappa_segment_upper_by_m", {})
+        if not isinstance(raw_m_bounds, Mapping):
+            raise ValueError("invalid controller m dependence bounds")
+        controller.kappa_segment_upper_by_m = {}
+        for key, raw_value in raw_m_bounds.items():
+            m_key = _strict_nonnegative_int(key, "controller m dependence key")
+            value = float(raw_value)
+            if m_key < 1 or not math.isfinite(value) or value < 1.0 or value > float(m_key):
+                raise ValueError("invalid controller m dependence bound")
+            controller.kappa_segment_upper_by_m[m_key] = value
         raw_qm = state.get("kappa_segment_upper_by_qm", [])
         if isinstance(raw_qm, Mapping):
             # Accept the transient tuple-key representation used by early
@@ -1378,16 +2692,22 @@ class BudgetedPolySegController:
                 {"q": key[0], "m": key[1], "value": value}
                 for key, value in raw_qm.items()
             ]
-        controller.kappa_segment_upper_by_qm = {
-            (int(item["q"]), int(item["m"])): min(
-                max(float(item["value"]), 1.0), float(int(item["m"]))
-            )
-            for item in raw_qm
-            if int(item["q"]) >= 0
-            and int(item["m"]) >= 1
-            and math.isfinite(float(item["value"]))
-        }
-        controller.kappa_trajectory_upper = max(float(state.get("kappa_trajectory_upper", 1.0)), 1.0)
+        if not isinstance(raw_qm, (list, tuple)):
+            raise ValueError("invalid controller q/m dependence bounds")
+        controller.kappa_segment_upper_by_qm = {}
+        for item in raw_qm:
+            if not isinstance(item, Mapping):
+                raise ValueError("invalid controller q/m dependence entry")
+            q_key = _strict_nonnegative_int(item["q"], "controller q dependence key")
+            m_key = _strict_nonnegative_int(item["m"], "controller m dependence key")
+            value = float(item["value"])
+            if m_key < 1 or not math.isfinite(value) or value < 1.0 or value > float(m_key):
+                raise ValueError("invalid controller q/m dependence bound")
+            controller.kappa_segment_upper_by_qm[(q_key, m_key)] = value
+        trajectory_upper = float(state.get("kappa_trajectory_upper", 1.0))
+        if not math.isfinite(trajectory_upper) or trajectory_upper < 1.0:
+            raise ValueError("invalid controller trajectory dependence bound")
+        controller.kappa_trajectory_upper = trajectory_upper
         choice = state.get("last_choice")
         controller.last_choice = None if choice is None else PolySegChoice(**choice)
         if controller.total_budget is not None and controller.consumed_budget > controller.total_budget + 1e-8:
@@ -1406,9 +2726,11 @@ class SegmentRewardBudget:
     """
 
     def __init__(self, total: float, *, cost_per_query: float = 1.0):
-        if total < 0:
+        _strict_real(total, "total budget")
+        _strict_real(cost_per_query, "cost_per_query", strictly_positive=True)
+        if not math.isfinite(float(total)) or total < 0:
             raise ValueError("total budget must be non-negative")
-        if cost_per_query <= 0:
+        if not math.isfinite(float(cost_per_query)) or cost_per_query <= 0:
             raise ValueError("cost_per_query must be positive")
         self.total = float(total)
         self.cost_per_query = float(cost_per_query)
@@ -1516,10 +2838,27 @@ class SegmentRewardBudget:
     def from_state_dict(cls, state: Mapping[str, float]) -> "SegmentRewardBudget":
         obj = cls(state["total"], cost_per_query=state.get("cost_per_query", 1.0))
         obj.consumed = float(state.get("consumed", 0.0))
-        obj._reservations = {str(k): float(v) for k, v in state.get("reservations", {}).items()}
+        reservations = state.get("reservations", {})
+        settled = state.get("settled", {})
+        if not isinstance(reservations, Mapping) or not isinstance(settled, Mapping):
+            raise ValueError("invalid budget state: reservations and settled must be mappings")
+        obj._reservations = {str(k): float(v) for k, v in reservations.items()}
         obj.reserved = float(state.get("reserved", sum(obj._reservations.values())))
-        obj._settled = {str(k): float(v) for k, v in state.get("settled", {}).items()}
-        if obj.consumed < -1e-8 or obj.reserved < -1e-8 or obj.consumed + obj.reserved > obj.total + 1e-8:
+        obj._settled = {str(k): float(v) for k, v in settled.items()}
+        values = [obj.consumed, obj.reserved, *obj._reservations.values(), *obj._settled.values()]
+        if any(not math.isfinite(value) or value < -1e-8 for value in values):
+            raise ValueError("invalid budget state: values must be finite and non-negative")
+        if set(obj._reservations).intersection(obj._settled):
+            raise ValueError("invalid budget state: reservation is both active and settled")
+        if state.get("reservations") is not None and not math.isclose(
+            obj.reserved, sum(obj._reservations.values()), rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError("invalid budget state: reserved total does not match reservations")
+        if state.get("settled") is not None and not math.isclose(
+            obj.consumed, sum(obj._settled.values()), rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError("invalid budget state: consumed total does not match settled costs")
+        if obj.consumed + obj.reserved > obj.total + 1e-8:
             raise ValueError("invalid budget state: consumed plus reserved exceeds total")
         return obj
 
@@ -1576,7 +2915,8 @@ class FileBackedSegmentRewardBudget:
         }
 
     def _validate_config(self, state: Mapping[str, Any]) -> None:
-        if int(state.get("schema_version", 0)) != self._SCHEMA_VERSION:
+        schema_version = state.get("schema_version", 0)
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != self._SCHEMA_VERSION:
             raise ValueError("unsupported PolySeg shared-ledger schema")
         total = float(state["total"])
         cost = float(state.get("cost_per_query", 1.0))
@@ -1762,6 +3102,7 @@ class PolynomialTransitionEstimator:
         self.design: torch.Tensor | None = None
         self._gram: torch.Tensor | None = None
         self._sample_count = 0
+        self.target_semantics = "next_features"
 
     @property
     def dimension(self) -> int:
@@ -1797,11 +3138,62 @@ class PolynomialTransitionEstimator:
             self._gram = x.T @ x
             self._sample_count = int(x.shape[0])
             self.design = x.detach()
+        self.target_semantics = "next_features"
         return self
+
+    def fit_test_function(
+        self,
+        z: torch.Tensor,
+        next_features: torch.Tensor,
+        test_function,
+        *,
+        accumulate: bool = False,
+        state: PolynomialEstimatorState | None = None,
+    ) -> "PolynomialTransitionEstimator":
+        """Fit ``P f(z) = E[f(X') | z]`` from observed successor states.
+
+        A vector fit of ``E[X' | z]`` can only be plugged into a value model
+        without changing the estimand when that value model is affine in the
+        successor features.  Polynomial critics with ``q > 1`` are nonlinear,
+        so ``V(E[X'])`` is generally different from ``E[V(X')]``.  This helper
+        evaluates the declared test function on each observed successor and
+        regresses that scalar/vector target directly, preserving the
+        action-conditioned ``P V`` object required by the macro Bellman
+        backup.
+        """
+
+        successor = _as_tensor(next_features)
+        targets = test_function(successor)
+        targets = _as_tensor(targets, device=successor.device)
+        if targets.ndim == 1:
+            targets = targets.unsqueeze(-1)
+        if targets.ndim != 2 or targets.shape[0] != successor.shape[0]:
+            raise ValueError("test_function must return [samples] or [samples, outputs]")
+        fitted = self.fit(z, targets, accumulate=accumulate, state=state)
+        fitted.target_semantics = "test_function"
+        return fitted
+
+    def predict_test_function(self, z: torch.Tensor) -> torch.Tensor:
+        """Predict the fitted ``P f`` test function value(s)."""
+
+        if self.theta is None:
+            raise RuntimeError("transition estimator must be fit before predict")
+        x = legendre_features(z, self.q, basis=self.basis)
+        prediction = x @ self.theta
+        return prediction.squeeze(-1) if prediction.shape[-1] == 1 else prediction
+
+    def features(self, z: torch.Tensor | np.ndarray | Sequence[float]) -> torch.Tensor:
+        """Return the action-conditioned transition design features."""
+
+        return legendre_features(_as_tensor(z), self.q, basis=self.basis)
 
     def predict_next_features(self, z: torch.Tensor) -> torch.Tensor:
         if self.theta is None:
             raise RuntimeError("transition estimator must be fit before predict")
+        if self.target_semantics != "next_features":
+            raise RuntimeError(
+                "transition estimator was fit on a test function; use predict_test_function"
+            )
         x = legendre_features(z, self.q, basis=self.basis)
         return x @ self.theta
 
@@ -2358,7 +3750,8 @@ def compute_segment_policy_loss(
     safe_ids = ids.clamp_min(0)
     if safe_ids.shape != log_prob.shape:
         raise ValueError("segment_ids_tensor must match log-probability shape")
-    segment_count = max(num_segments, int(safe_ids.max().item()) + 1 if safe_ids.numel() else 0)
+    observed_segment_count = int(safe_ids.max().item()) + 1 if safe_ids.numel() else 0
+    segment_count = max(num_segments, observed_segment_count)
     feedback = None
     if segment_feedback_mask is not None:
         feedback = segment_feedback_mask.to(device=log_prob.device, dtype=torch.bool)
@@ -2367,10 +3760,22 @@ def compute_segment_policy_loss(
         if feedback.ndim != 2 or feedback.shape[0] != log_prob.shape[0]:
             raise ValueError("segment_feedback_mask batch axis must match log probabilities")
         # TransferQueue pads the macro axis independently in each actor
-        # microbatch. Do not invent configured-m entries or broadcast labels
-        # across segments when a short response has a smaller native axis.
-        segment_count = feedback.shape[1]
-        if segment_count == 0:
+        # microbatch. A microbatch can therefore carry a mask narrower than
+        # the token-aligned segment ids. Missing entries mean that no feedback
+        # was transported for that segment and must be excluded from PPO;
+        # never broadcast a shorter mask or mark those entries as observed.
+        feedback_width = feedback.shape[1]
+        # A configured macro axis larger than the observed response is a
+        # batch-level contract: a narrow mask there means metadata was lost.
+        # When the configured axis equals the observed short rollout, a
+        # narrower mask is a legitimate ragged microbatch and is padded with
+        # unqueried entries below.
+        if feedback_width < observed_segment_count and num_segments > observed_segment_count:
+            raise ValueError(
+                "segment_feedback_mask must cover every observed segment id"
+            )
+        segment_count = max(segment_count, feedback_width)
+        if feedback_width == 0:
             if torch.any(response_mask):
                 raise ValueError("segment_feedback_mask must cover every observed segment")
             zero = log_prob.sum() * 0.0
@@ -2379,8 +3784,12 @@ def compute_segment_policy_loss(
                 "segment/clip_fraction": zero.detach(),
                 "segment/advantage_mean": zero.detach(),
             }
-        if safe_ids.numel() and int(safe_ids.max().item()) >= segment_count:
-            raise ValueError("segment_feedback_mask must cover every observed segment")
+        if feedback_width != segment_count:
+            aligned = torch.zeros(
+                (feedback.shape[0], segment_count), dtype=torch.bool, device=feedback.device
+            )
+            aligned[:, : min(feedback_width, segment_count)] = feedback[:, :segment_count]
+            feedback = aligned
     segment_advantages = pool_token_values(
         token_advantages,
         safe_ids,
@@ -2484,7 +3893,11 @@ def compute_segment_gae_advantage(
         delta = rewards[:, j] + discount * successor - current_values[:, j]
         next_gae = (delta + discount * lam * next_gae) * active
         advantages[:, j] = next_gae
-        next_value = current_values[:, j] * active + next_value * (1.0 - active)
+        # A masked slot breaks the chain completely.  Preserving the old
+        # next_value here let a valid segment before a missing one use the
+        # value of a later segment as its successor, which disagreed with
+        # macro_return_targets' reset semantics.
+        next_value = current_values[:, j] * active
     returns = (advantages + current_values) * valid.to(rewards.dtype)
     if normalize:
         advantages = _masked_whiten(advantages, valid)
@@ -2629,6 +4042,8 @@ def compute_polyseg_advantage(
     segment_targets: torch.Tensor | None = None,
     segment_next_features: torch.Tensor | None = None,
     segment_transition_mask: torch.Tensor | None = None,
+    step_features: torch.Tensor | None = None,
+    shared_step_reward_estimator: SharedStepRewardEstimator | None = None,
     estimator_state: PolynomialEstimatorState | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """verl-compatible entry point for macro GAE.
@@ -2658,6 +4073,30 @@ def compute_polyseg_advantage(
         if m_override is not None:
             non_tensor_batch["polyseg_adaptive_m"] = np.asarray(selected_m)
     estimator_state = _resolve_estimator_state(cfg, estimator_state)
+    dependence_state = _resolve_dependence_state(cfg)
+    pending_dependence_history: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    pending_dependence_radius: float | None = None
+
+    def _commit_dependence_state() -> None:
+        """Commit diagnostics only after the batch has produced an advantage."""
+
+        if pending_dependence_history is not None:
+            design, targets_for_history, valid_for_history, weights_for_history, scores = pending_dependence_history
+            seen: set[int] = set()
+            for state in (estimator_state, dependence_state):
+                if state is None or id(state) in seen:
+                    continue
+                seen.add(id(state))
+                state.append_dependence_history(
+                    design,
+                    targets_for_history,
+                    valid_for_history,
+                    weights=weights_for_history,
+                    score_residuals=scores,
+                )
+        if dependence_state is not None and pending_dependence_radius is not None:
+            dependence_state.update_dependence_radius(pending_dependence_radius)
+
     token_level_rewards = _as_tensor(token_level_rewards)
     response_mask = response_mask.to(dtype=torch.bool)
     if segment_rewards is None:
@@ -2704,10 +4143,29 @@ def compute_polyseg_advantage(
         segment_transition_mask = _extract_polyseg_field(batch, "segment_transition_mask")
     if segment_transition_mask is None:
         segment_transition_mask = _extract_polyseg_field(non_tensor_batch, "segment_transition_mask")
+    if step_features is None:
+        step_features = _extract_polyseg_field(batch, "step_features")
+    if step_features is None:
+        step_features = _extract_polyseg_field(non_tensor_batch, "step_features")
+    segment_ids_source = "rollout"
     if segment_ids_tensor is None:
+        if cfg.use_polynomial_critic or cfg.reward_route == "shared_step":
+            # Equal-width inference here can disagree with the event boundaries
+            # used later by the PPO ratio, which silently misassigns macro
+            # advantages.  Research paths must supply rollout-owned IDs.
+            raise ValueError(
+                "PolySeg research advantages require rollout-owned segment_ids; "
+                "equal-width inference is only available for explicit smoke callers"
+            )
         segment_ids_tensor = _infer_ids_from_mask(response_mask, cfg.m)
+        segment_ids_source = "inferred_equal_width"
     else:
         segment_ids_tensor = segment_ids_tensor.to(device=token_level_rewards.device, dtype=torch.long)
+    if non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__"):
+        non_tensor_batch["polyseg_segment_ids_source"] = np.full(
+            (token_level_rewards.shape[0],), 0.0 if segment_ids_source == "rollout" else 1.0,
+            dtype=np.float32,
+        )
     # ``-1`` denotes response padding.  Pooling cannot accept it as an index,
     # so replace it temporarily and restore the mask through response_mask.
     safe_ids = segment_ids_tensor.clamp_min(0)
@@ -2735,6 +4193,32 @@ def compute_polyseg_advantage(
         # Keep rollout structure for audit, but exclude unqueried fallback
         # segments from critic fitting and macro advantage propagation.
         segment_mask = segment_mask & segment_feedback_mask
+    if cfg.reward_route == "shared_step":
+        if step_features is None:
+            raise ValueError(
+                "reward_route='shared_step' requires rollout-provided frozen per-step features"
+            )
+        recovered, fitted_shared = recover_step_rewards_from_segment_feedback(
+            _as_tensor(step_features, device=token_level_rewards.device),
+            segment_ids_tensor,
+            segment_rewards,
+            ridge_lambda=cfg.ridge_lambda,
+            segment_mask=segment_mask,
+            step_mask=response_mask,
+            q=cfg.q,
+            basis=cfg.basis,
+            normalized_basis=cfg.normalized_basis,
+        )
+        segment_rewards = pool_token_values(
+            recovered,
+            safe_ids,
+            num_segments=segment_rewards.shape[1],
+            mask=response_mask,
+            reduction="sum",
+        )
+        if non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__"):
+            non_tensor_batch["polyseg_shared_step_reward_recovered"] = recovered.detach().cpu().numpy()
+            non_tensor_batch["polyseg_shared_step_reward_theta"] = fitted_shared.theta.detach().cpu().numpy()
     # Legacy callers may omit durations; retain their historical unit-duration
     # semantics unless the caller supplied the metadata or an optimistic
     # transition/confidence path explicitly requires the theorem range.
@@ -2808,7 +4292,15 @@ def compute_polyseg_advantage(
     # multiplier remains one for the ordinary fixed-control path and when no
     # dependence diagnostics are available (for example a tiny compatibility
     # caller without a non-tensor side channel).
-    dependence_radius_multiplier = 1.0
+    pre_update_dependence_radius_multiplier = (
+        1.0
+        if dependence_state is None
+        else max(float(dependence_state.dependence_radius_multiplier), 1.0)
+    )
+    # This is the multiplier actually used by the online bonus.  A stateful
+    # confidence path must use the prior batch's value; the current batch's
+    # diagnostic is committed only after the advantage is successfully built.
+    dependence_radius_multiplier = pre_update_dependence_radius_multiplier
     if cfg.use_polynomial_critic and segment_features is not None:
         features = _as_tensor(segment_features, device=token_level_rewards.device)
         if features.ndim == 2:
@@ -2851,7 +4343,16 @@ def compute_polyseg_advantage(
         # Dependence diagnostics operate on cross-fitted polynomial score
         # residuals. They are computed before the in-sample critic fit so the
         # confidence correction cannot be made artificially optimistic.
-        if non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__"):
+        if (
+            (non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__"))
+            or estimator_state is not None
+            or dependence_state is not None
+        ):
+            diagnostic_sink = (
+                non_tensor_batch
+                if non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__")
+                else {}
+            )
             dependence = _polyseg_dependence_metrics(
                 features,
                 segment_rewards.to(dtype=features.dtype),
@@ -2862,11 +4363,42 @@ def compute_polyseg_advantage(
                 ridge_lambda=cfg.ridge_lambda,
                 binary=normalize_feedback_protocol(cfg.feedback) == "binary_local",
                 logistic_l2=cfg.logistic_l2,
+                weight_policy="segment_duration" if cfg.critic_weighting == "duration" else "unit",
+                history_state=estimator_state if estimator_state is not None else dependence_state,
+                persistent_history=estimator_state is not None or dependence_state is not None,
             )
-            dependence_radius_multiplier = float(
+            observed_dependence_radius_multiplier = float(
                 max(dependence["iid_cluster_radius_ratio_upper"], 1.0)
             )
+            design_dimension = int(
+                legendre_features(
+                    features.reshape(-1, features.shape[-1]), cfg.q, basis=cfg.basis
+                ).shape[-1]
+            )
+            explicit_radius = dependence_confidence_radius(
+                dimension=design_dimension,
+                effective_samples=max(float(valid.sum().item()), 1.0),
+                delta=cfg.confidence_delta,
+                kappa_segment=float(dependence["kappa_segment_upper"]),
+                kappa_trajectory=float(dependence["kappa_trajectory_upper"]),
+            )
+            # Keep the historical empirical multiplier by default.  Users can
+            # opt into the explicit delta-dependent radius for theorem-aligned
+            # optimism without changing old checkpoints' numerical behavior.
+            if cfg.use_formal_confidence_radius:
+                observed_dependence_radius_multiplier *= max(1.0, explicit_radius)
+            if dependence_state is None:
+                # Preserve the legacy non-stateful diagnostic behavior.
+                dependence_radius_multiplier = observed_dependence_radius_multiplier
+            else:
+                pending_dependence_radius = observed_dependence_radius_multiplier
             diagnostic_fields = {
+                "polyseg_dependence_available": float(
+                    bool(dependence.get("dependence_available", True))
+                ),
+                "polyseg_dependence_missing": float(
+                    not bool(dependence.get("dependence_available", True))
+                ),
                 "polyseg_kappa_segment": dependence["kappa_segment"],
                 "polyseg_kappa_segment_upper": dependence["kappa_segment_upper"],
                 "polyseg_kappa_segment_selected_upper": dependence.get(
@@ -2874,6 +4406,13 @@ def compute_polyseg_advantage(
                 ).get(cfg.m, dependence["kappa_segment_upper"]),
                 "polyseg_kappa_trajectory": dependence["kappa_trajectory"],
                 "polyseg_kappa_trajectory_upper": dependence["kappa_trajectory_upper"],
+                "polyseg_nominal_observations": dependence["nominal_observations"],
+                "polyseg_dependence_cluster_count": dependence["cluster_count"],
+                "polyseg_total_observation_weight": dependence["total_observation_weight"],
+                "polyseg_weighted_ess_ratio": dependence["weighted_ess_ratio"],
+                "polyseg_dependence_weighted_by_duration": float(
+                    dependence["weight_policy"] == "segment_duration"
+                ),
                 "polyseg_effective_samples": dependence["effective_samples"],
                 "polyseg_weighted_effective_samples": dependence["weighted_effective_samples"],
                 "polyseg_iid_cluster_radius_ratio": dependence["iid_cluster_radius_ratio"],
@@ -2882,14 +4421,53 @@ def compute_polyseg_advantage(
                 "polyseg_hac_lag": dependence["hac_lag"],
                 "polyseg_dependence_diagnostic_oof": dependence["diagnostic_oof"],
                 "polyseg_dependence_residual_rms": dependence["residual_rms"],
-                "polyseg_dependence_radius_multiplier": dependence_radius_multiplier,
+                # This historical field reports the observed post-update
+                # diagnostic.  The separate fields make the online semantics
+                # explicit for confidence-enabled runs.
+                "polyseg_dependence_radius_multiplier": observed_dependence_radius_multiplier,
+                "polyseg_dependence_radius_multiplier_pre_update": pre_update_dependence_radius_multiplier,
+                "polyseg_dependence_radius_multiplier_post_update": observed_dependence_radius_multiplier,
+                "polyseg_confidence_radius": explicit_radius,
+                "polyseg_confidence_radius_pre_update": pre_update_dependence_radius_multiplier,
+                "polyseg_confidence_radius_post_update": observed_dependence_radius_multiplier,
+                "polyseg_dependence_state_batches": float(
+                    dependence_state.dependence_diagnostic_batches + 1
+                    if dependence_state is not None
+                    else 0
+                ),
+                "polyseg_confidence_delta": cfg.confidence_delta,
                 "polyseg_dependence_logistic_score": float(
                     dependence.get("dependence_score_model") == "logistic_fisher_score"
                 ),
+                "polyseg_dependence_persistent_oof": float(
+                    dependence.get("dependence_oof_mode") == "persistent_prequential_history"
+                ),
+                "polyseg_dependence_history_trajectories": float(
+                    len(estimator_state.dependence_history) if estimator_state is not None else 0
+                ),
             }
             for field, value in diagnostic_fields.items():
-                non_tensor_batch[field] = np.full(
+                diagnostic_sink[field] = np.full(
                     (segment_rewards.shape[0],), float(value), dtype=np.float32
+                )
+            if estimator_state is not None or dependence_state is not None:
+                # Defer the mutation until the complete advantage path returns;
+                # a failed batch must not advance either history or radius.
+                design = legendre_features(
+                    features.reshape(-1, features.shape[-1]), cfg.q, basis=cfg.basis
+                ).reshape(features.shape[0], features.shape[1], -1)
+                score_rows = design * _as_tensor(dependence["oof_residuals"], device=design.device).unsqueeze(-1)
+                history_weights = (
+                    segment_durations
+                    if cfg.critic_weighting == "duration"
+                    else torch.ones_like(segment_rewards)
+                )
+                pending_dependence_history = (
+                    design,
+                    segment_rewards.to(dtype=design.dtype),
+                    valid,
+                    history_weights,
+                    score_rows,
                 )
         binary_feedback = normalize_feedback_protocol(cfg.feedback) == "binary_local"
         if binary_feedback:
@@ -3014,6 +4592,7 @@ def compute_polyseg_advantage(
                 token_mask=response_mask,
             )
             _, _, token_advantages, token_returns = result
+            _commit_dependence_state()
             return token_advantages, token_returns
         if cfg.polynomial_target == "return":
             if segment_targets is None:
@@ -3101,6 +4680,11 @@ def compute_polyseg_advantage(
         # missing field is an error rather than a silent return-critic
         # fallback, which keeps the theoretical transition claim honest.
         if cfg.use_transition_estimator:
+            if estimator_state is not None:
+                raise ValueError(
+                    "use_transition_estimator requires a non-accumulating critic: "
+                    "the P V test function changes after each Bellman backup"
+                )
             if segment_next_features is None:
                 raise ValueError(
                     "use_transition_estimator=True requires segment_next_features "
@@ -3141,15 +4725,24 @@ def compute_polyseg_advantage(
                     else estimator_state.transition_gram
                 ),
             )
-            transition.fit(
+            # Fit the transition estimator on the observed successor value
+            # directly.  Fitting E[X'|X,U] and then evaluating V(E[X'])
+            # changes the Bellman estimand for nonlinear critics; the required
+            # object is E[V(X')|X,U] = P V.
+            transition.fit_test_function(
                 features[transition_valid],
                 next_features[transition_valid],
+                lambda successor: critic.predict(successor),
                 accumulate=estimator_state is not None,
                 state=estimator_state,
             )
-            predicted_next = transition.predict_next_features(features.reshape(-1, features.shape[-1]))
-            predicted_next = predicted_next.reshape_as(features)
-            transition_successor_values = critic.predict(predicted_next.reshape(-1, features.shape[-1])).reshape_as(segment_rewards)
+            transition_successor_values = transition.predict_test_function(
+                features.reshape(-1, features.shape[-1])
+            ).reshape_as(segment_rewards)
+            if non_tensor_batch is not None and hasattr(non_tensor_batch, "__setitem__"):
+                non_tensor_batch["polyseg_transition_target_semantics"] = np.full(
+                    (segment_rewards.shape[0],), "p_v_test_function", dtype="<U32"
+                )
             transition_successor_values = _clip_segment_values_to_r_max(
                 transition_successor_values,
                 segment_durations,
@@ -3241,10 +4834,13 @@ def compute_polyseg_advantage(
             # iterative Bellman refit below.
             backup_iterations = 0 if estimator_state is not None else cfg.transition_backup_iterations
             for _ in range(backup_iterations):
-                predicted_next = transition.predict_next_features(features.reshape(-1, features.shape[-1]))
-                predicted_next = predicted_next.reshape_as(features)
-                transition_successor_values = critic.predict(
-                    predicted_next.reshape(-1, features.shape[-1])
+                transition.fit_test_function(
+                    features[transition_valid],
+                    next_features[transition_valid],
+                    lambda successor: critic.predict(successor),
+                )
+                transition_successor_values = transition.predict_test_function(
+                    features.reshape(-1, features.shape[-1])
                 ).reshape_as(segment_rewards)
                 transition_successor_values = _clip_segment_values_to_r_max(
                     transition_successor_values,
@@ -3267,9 +4863,14 @@ def compute_polyseg_advantage(
                     targets[valid],
                     sample_weight=None if critic_weights is None else critic_weights[valid],
                 )
-            predicted_next = transition.predict_next_features(features.reshape(-1, features.shape[-1]))
-            transition_successor_values = critic.predict(
-                predicted_next.reshape(-1, features.shape[-1])
+            if backup_iterations:
+                transition.fit_test_function(
+                    features[transition_valid],
+                    next_features[transition_valid],
+                    lambda successor: critic.predict(successor),
+                )
+            transition_successor_values = transition.predict_test_function(
+                features.reshape(-1, features.shape[-1])
             ).reshape_as(segment_rewards)
             transition_successor_values = _clip_segment_values_to_r_max(
                 transition_successor_values,
@@ -3307,6 +4908,19 @@ def compute_polyseg_advantage(
         bellman_mse = (
             bellman_residual.detach().square()[valid]
         ).mean() if torch.any(valid) else bellman_residual.new_zeros(())
+        closure_residual = bellman_closure_residual(
+            effective_segment_rewards,
+            next_values,
+            segment_values,
+            mask=valid,
+            gamma=cfg.gamma,
+            durations=durations_for_residual,
+        )
+        if cfg.bellman_closure_tolerance > 0 and float(closure_residual.detach().cpu()) > cfg.bellman_closure_tolerance:
+            raise ValueError(
+                "empirical Bellman closure residual exceeds configured tolerance: "
+                f"{float(closure_residual):.6g} > {cfg.bellman_closure_tolerance:.6g}"
+            )
         # Keep diagnostics in the non-tensor side channel.  Putting scalar
         # fields in the training TensorDict would make padding-free actor and
         # critic workers treat them as sequence fields.
@@ -3324,6 +4938,9 @@ def compute_polyseg_advantage(
             )
             non_tensor_batch["polyseg_bellman_residual_mse"] = np.full(
                 (segment_rewards.shape[0],), float(bellman_mse.detach().cpu()), dtype=np.float32
+            )
+            non_tensor_batch["polyseg_bellman_closure_residual"] = np.full(
+                (segment_rewards.shape[0],), float(closure_residual.detach().cpu()), dtype=np.float32
             )
             non_tensor_batch["polyseg_confidence_bonus"] = np.full(
                 (segment_rewards.shape[0],), float(confidence.detach().mean().cpu()), dtype=np.float32
@@ -3383,6 +5000,8 @@ def compute_polyseg_advantage(
                 )
                 spectral_tail = theta[tail_mask].square().sum() / total_energy
                 theta_stability = torch.zeros((), dtype=theta.dtype, device=theta.device)
+                prediction_stability = torch.zeros((), dtype=theta.dtype, device=theta.device)
+                theta_stability_available = 0.0
                 if cfg.q >= 1:
                     low_q = cfg.q // 2
                     low_critic = PolynomialSegmentCritic(
@@ -3394,13 +5013,21 @@ def compute_polyseg_advantage(
                         normalized_basis=cfg.normalized_basis,
                     )
                     low_critic.fit(features[valid], raw_targets[valid])
-                    # Compare coefficient stability on the shared low-degree
-                    # basis, not only predictions on the same training rows.
+                    # Coefficient stability on the shared low-degree basis.
                     full_theta = critic.theta.detach()[: low_critic.dimension]
                     low_theta = low_critic.theta.detach()
                     theta_stability = (full_theta - low_theta).norm() / low_theta.norm().clamp_min(1e-12)
-                heldout_residual = torch.zeros((), dtype=theta.dtype, device=theta.device)
-                heldout_bellman = torch.zeros((), dtype=theta.dtype, device=theta.device)
+                    # Prediction stability is a different quantity and must not
+                    # be conflated with coefficient stability.
+                    full_pred = critic.predict(features[valid]).detach()
+                    low_pred = low_critic.predict(features[valid]).detach()
+                    prediction_stability = (full_pred - low_pred).norm() / full_pred.norm().clamp_min(1e-12)
+                    theta_stability_available = 1.0
+                # Unavailable diagnostics are NaN with an explicit availability
+                # flag; a missing held-out split must not look like zero error.
+                heldout_residual = torch.full((), float("nan"), dtype=theta.dtype, device=theta.device)
+                heldout_bellman = torch.full((), float("nan"), dtype=theta.dtype, device=theta.device)
+                heldout_available = 0.0
                 if features.shape[0] >= 2:
                     heldout_rows = torch.arange(features.shape[0], device=features.device) % 2 == 1
                     fit_rows = ~heldout_rows
@@ -3430,15 +5057,20 @@ def compute_polyseg_advantage(
                         )
                         eval_bellman = eval_rewards + eval_discounts * eval_next - eval_values
                         heldout_bellman = eval_bellman[eval_valid].square().mean()
+                        heldout_available = 1.0
                 for key, value in (
                     ("polyseg_empirical_spectral_tail", spectral_tail),
                     ("polyseg_theta_q_stability", theta_stability),
+                    ("polyseg_prediction_q_stability", prediction_stability),
+                    ("polyseg_q_stability_available", torch.as_tensor(theta_stability_available, dtype=theta.dtype, device=theta.device)),
                     ("polyseg_heldout_return_residual_mse", heldout_residual),
                     ("polyseg_heldout_bellman_residual_mse", heldout_bellman),
+                    ("polyseg_heldout_diagnostics_available", torch.as_tensor(heldout_available, dtype=theta.dtype, device=theta.device)),
                 ):
                     non_tensor_batch[key] = np.full(
                         (segment_rewards.shape[0],), float(value.detach().cpu()), dtype=np.float32
                     )
+
     elif segment_values is None:
         segment_values = pooled_values
     if transition_successor_values is not None:
@@ -3473,6 +5105,7 @@ def compute_polyseg_advantage(
             transition_advantages = _masked_whiten(transition_advantages, valid)
         token_advantages = scatter_segment_values(transition_advantages, safe_ids, mask=response_mask)
         token_returns = scatter_segment_values(transition_returns, safe_ids, mask=response_mask)
+        _commit_dependence_state()
         return token_advantages, token_returns
     result = compute_segment_gae_advantage(
         effective_segment_rewards,
@@ -3486,6 +5119,7 @@ def compute_polyseg_advantage(
         token_mask=response_mask,
     )
     _, _, token_advantages, token_returns = result
+    _commit_dependence_state()
     return token_advantages, token_returns
 
 
@@ -3523,6 +5157,147 @@ def _feedback_factor(m: int, horizon: int, r_max: float, feedback: str) -> float
     log_factor = float(horizon) * float(r_max) / (2.0 * float(m))
     return math.exp(min(log_factor, math.log(sys.float_info.max)))
 
+
+def _statistical_round_counts(
+    *,
+    episodes: int,
+    m: int,
+    q: int,
+    dependence_chi: float,
+    selector_norm: str,
+    kappa_segment_upper_by_m: Mapping[int, float] | None,
+    kappa_segment_upper_by_qm: Mapping[tuple[int, int], float] | None,
+    kappa_trajectory_upper: float,
+    kappa_fallback: str = "auto",
+) -> tuple[float, float]:
+    """Return ``(information_samples, statistical_rounds)`` for one candidate.
+
+    ``information_samples`` controls the identifiability constraint
+    ``D_q <= information_samples``; it is always the conservative
+    dependence-discounted count for the dependence-aware norms.
+    ``statistical_rounds`` is the term that enters the statistical regret:
+    effective-round normalization counts effective macro rounds, while the
+    segment-update normalization counts actual segment decisions inflated by
+    dependence.  Keeping both in one helper prevents the selector and the
+    reported bound from drifting apart.
+    """
+
+    if selector_norm == "power":
+        information = episodes * (m**dependence_chi)
+        return information, information
+    qm_grid = {
+        (int(key[0]), int(key[1])): float(value)
+        for key, value in (kappa_segment_upper_by_qm or {}).items()
+        if isinstance(key, tuple) and len(key) == 2 and math.isfinite(float(value))
+    }
+    kappa_grid = {
+        int(key): float(value)
+        for key, value in (kappa_segment_upper_by_m or {}).items()
+        if int(key) >= 1 and math.isfinite(float(value))
+    }
+    # ``kappa`` is q-dependent.  ``auto`` (default) uses a supplied m-only
+    # estimate only while no q-specific cell exists for that m; once any order
+    # has been observed at m, an unseen order falls back to the conservative
+    # nominal bound m instead of importing a different order's estimate.
+    # ``nominal`` and ``per_m`` are explicit overrides for audits.
+    q_specific_m = {mm for _, mm in qm_grid}
+    if kappa_fallback == "per_m":
+        fallback = kappa_grid.get(m, float(m))
+    elif kappa_fallback == "nominal":
+        fallback = float(m)
+    elif kappa_fallback == "auto":
+        fallback = float(m) if m in q_specific_m else kappa_grid.get(m, float(m))
+    else:
+        raise ValueError("kappa_fallback must be 'auto', 'nominal' or 'per_m'")
+    kappa_seg = max(qm_grid.get((q, m), fallback), 1.0)
+    kappa_seg = min(kappa_seg, float(m))
+    information = episodes * m / (kappa_seg * kappa_trajectory_upper)
+    if selector_norm == "effective_round":
+        return information, information
+    return information, episodes * m * kappa_seg * kappa_trajectory_upper
+
+
+
+def _protocol_query_count(feedback: str, m: int) -> int:
+    """Number of verifier queries one trajectory needs for a protocol.
+
+    Terminal feedback observes only the final segment, so its actual query
+    count is one; every other protocol queries each segment.  Using ``m`` for
+    terminal overstates cost and rejects feasible high-m candidates.
+    """
+    canonical = normalize_feedback_protocol(feedback)
+    if canonical == "terminal":
+        return 1
+    return int(m)
+
+
+def _objective_terms(
+    *,
+    q: int,
+    m: int,
+    episodes: int,
+    horizon: int,
+    feature_dim: int,
+    feedback: str,
+    dependence_chi: float,
+    stat_exponent_u: float,
+    approx_exponent_v: float,
+    segment_exponent_gamma: float,
+    stat_constant: float,
+    approx_constant: float,
+    segment_constant: float,
+    selector_norm: str,
+    kappa_segment_upper_by_m: Mapping[int, float] | None,
+    kappa_segment_upper_by_qm: Mapping[tuple[int, int], float] | None,
+    kappa_trajectory_upper: float,
+    r_max: float,
+    segment_cost: float,
+    critic_compute_cost: float = 0.0,
+    cost_penalty: float = 0.0,
+    approx_dimension_exponent: float | None = None,
+) -> dict[str, float]:
+    """Single decomposition shared by the selector and the reported bound."""
+    dimension = q + 1 if feature_dim == 1 else math.comb(feature_dim + q, feature_dim)
+    information, statistical_rounds = _statistical_round_counts(
+        episodes=episodes,
+        m=m,
+        q=q,
+        dependence_chi=dependence_chi,
+        selector_norm=selector_norm,
+        kappa_segment_upper_by_m=kappa_segment_upper_by_m,
+        kappa_segment_upper_by_qm=kappa_segment_upper_by_qm,
+        kappa_trajectory_upper=kappa_trajectory_upper,
+    )
+    factor = _feedback_factor(m, horizon, r_max, feedback)
+    statistical = _saturating_product(
+        stat_constant, factor, dimension**stat_exponent_u, math.sqrt(max(statistical_rounds, 1e-12))
+    )
+    exponent = (
+        max(0.0, stat_exponent_u - 0.5)
+        if approx_dimension_exponent is None
+        else float(approx_dimension_exponent)
+    )
+    approximation = approx_constant * episodes * (dimension**exponent) * (q + 1) ** (-approx_exponent_v)
+    segment_term = 0.0 if normalize_feedback_protocol(feedback) == "local_sum" else (
+        segment_constant * episodes * (horizon / m) ** segment_exponent_gamma
+    )
+    query_count = _protocol_query_count(feedback, m)
+    query_cost = episodes * query_count * segment_cost
+    compute_cost = episodes * m * dimension * float(critic_compute_cost)
+    objective = statistical + approximation + segment_term + cost_penalty * (query_cost + compute_cost)
+    return {
+        "dimension": float(dimension),
+        "information_samples": float(information),
+        "statistical_rounds": float(statistical_rounds),
+        "feedback_factor": float(factor),
+        "statistical": float(statistical),
+        "approximation": float(approximation),
+        "segment": float(segment_term),
+        "query_count": float(query_count),
+        "query_cost": float(query_cost),
+        "compute_cost": float(compute_cost),
+        "objective": float(objective),
+    }
 
 def choose_polynomial_segment_config(
     *,
@@ -3594,60 +5369,42 @@ def choose_polynomial_segment_config(
         and int(key[1]) >= 1
         and math.isfinite(float(value))
     }
-    q_specific_m = {m for _, m in kappa_qm_grid}
     candidates: list[PolySegChoice] = []
     for m in sorted(set(int(x) for x in m_candidates)):
-        if m < 1 or m > horizon or episodes * m * segment_cost > (float("inf") if budget is None else budget) + 1e-8:
+        if m < 1 or m > horizon:
+            continue
+        # Budget feasibility must use the protocol's actual query count:
+        # terminal feedback queries one segment, not m.
+        if episodes * _protocol_query_count(feedback, m) * segment_cost > (
+            float("inf") if budget is None else budget
+        ) + 1e-8:
             continue
         for q in sorted(set(int(x) for x in q_candidates)):
             if q < 0:
                 continue
-            dimension = q + 1 if feature_dim == 1 else math.comb(feature_dim + q, feature_dim)
-            # A polynomial critic fits one feature vector per observed
-            # segment.  Keep this declared compute resource independent from
-            # verifier/suffix query cost so a q sweep cannot be advertised as
-            # budget matched while silently increasing critic work.
-            compute_cost = episodes * m * dimension * float(critic_compute_cost)
-            if compute_budget is not None and compute_cost > float(compute_budget) + 1e-8:
-                continue
-            if selector_norm == "power":
-                effective_samples = episodes * (m**dependence_chi)
-                statistical_rounds = effective_samples
-            else:
-                # Once q-specific diagnostics exist for m, do not transfer a
-                # different q's bound through the legacy m-only cache. Older
-                # controller checkpoints duplicated q-specific values there.
-                fallback = float(m) if m in q_specific_m else kappa_grid.get(m, float(m))
-                kappa_seg = max(kappa_qm_grid.get((q, m), fallback), 1.0)
-                kappa_seg = min(kappa_seg, float(m))
-                effective_samples = episodes * m / (kappa_seg * kappa_trajectory_upper)
-                if selector_norm == "effective_round":
-                    statistical_rounds = effective_samples
-                else:
-                    statistical_rounds = episodes * m * kappa_seg * kappa_trajectory_upper
-            effective_samples = max(float(effective_samples), 1e-12)
-            if dimension > effective_samples + 1e-8:
-                continue
-            factor = _feedback_factor(m, horizon, r_max, feedback)
-            statistical = _saturating_product(
-                stat_constant,
-                factor,
-                dimension**stat_exponent_u,
-                math.sqrt(statistical_rounds),
+            terms = _objective_terms(
+                q=q, m=m, episodes=episodes, horizon=horizon, feature_dim=feature_dim,
+                feedback=feedback, dependence_chi=dependence_chi,
+                stat_exponent_u=stat_exponent_u, approx_exponent_v=approx_exponent_v,
+                segment_exponent_gamma=segment_exponent_gamma,
+                stat_constant=stat_constant, approx_constant=approx_constant,
+                segment_constant=segment_constant, selector_norm=selector_norm,
+                kappa_segment_upper_by_m=kappa_grid, kappa_segment_upper_by_qm=kappa_qm_grid,
+                kappa_trajectory_upper=kappa_trajectory_upper, r_max=r_max,
+                segment_cost=segment_cost, critic_compute_cost=critic_compute_cost,
+                cost_penalty=cost_penalty,
             )
-            approximation = approx_constant * episodes * (dimension ** max(0.0, stat_exponent_u - 0.5)) * (q + 1) ** (-approx_exponent_v)
-            # Exact cumulative sum feedback is invariant to re-segmentation;
-            # do not charge a semantic compression bias unless the protocol
-            # actually compresses reward (utility/PRM/terminal-style paths).
-            segment_term = 0.0 if normalize_feedback_protocol(feedback) == "local_sum" else (
-                segment_constant * episodes * (horizon / m) ** segment_exponent_gamma
-            )
-            cost = episodes * m * segment_cost
-            objective = statistical + approximation + segment_term + cost_penalty * (cost + compute_cost)
+            # Identifiability and declared compute limits are constraints, not
+            # objective terms, so they are checked before ranking candidates.
+            if terms["dimension"] > max(terms["information_samples"], 1e-12) + 1e-8:
+                continue
+            if compute_budget is not None and terms["compute_cost"] > float(compute_budget) + 1e-8:
+                continue
             candidates.append(
                 PolySegChoice(
-                    q, m, objective, statistical, approximation, segment_term,
-                    factor, cost, dimension, compute_cost,
+                    q, m, terms["objective"], terms["statistical"], terms["approximation"],
+                    terms["segment"], terms["feedback_factor"], terms["query_cost"],
+                    int(terms["dimension"]), terms["compute_cost"],
                 )
             )
     if not candidates:
@@ -3671,28 +5428,55 @@ def segment_feedback_bound(
     stat_constant: float = 1.0,
     segment_constant: float = 1.0,
     segment_exponent_gamma: float = 1.0,
+    selector_norm: str = "power",
+    kappa_segment_upper_by_m: Mapping[int, float] | None = None,
+    kappa_segment_upper_by_qm: Mapping[tuple[int, int], float] | None = None,
+    kappa_trajectory_upper: float = 1.0,
+    segment_cost: float = 1.0,
+    critic_compute_cost: float = 0.0,
+    cost_penalty: float = 0.0,
+    approx_exponent_v: float | None = None,
+    approx_dimension_exponent: float | None = None,
 ) -> dict[str, float]:
-    """Return the decomposed empirical/theoretical bound terms."""
+    """Return the same objective decomposition the selector optimizes.
 
-    dimension = q + 1 if feature_dim == 1 else math.comb(feature_dim + q, feature_dim)
-    factor = _feedback_factor(m, horizon, r_max, feedback)
-    statistical = _saturating_product(
-        stat_constant,
-        factor,
-        dimension**stat_exponent_u,
-        math.sqrt(episodes * m**dependence_chi),
-    )
-    approximation = approx_constant * episodes * (q + 1) ** (-smoothness_s)
-    segment = 0.0 if normalize_feedback_protocol(feedback) == "local_sum" else (
-        segment_constant * episodes * (horizon / m) ** segment_exponent_gamma
+    ``approx_exponent_v`` defaults to ``smoothness_s`` so existing callers
+    keep their meaning; passing both lets a selector and its reported bound use
+    one identical approximation term.  ``query_count``/``query_cost`` are
+    protocol-aware (terminal feedback queries one segment).
+    """
+
+    if q < 0 or m < 1 or episodes < 1 or horizon < 1 or feature_dim < 1:
+        raise ValueError("q, m, episodes, horizon and feature_dim must be valid")
+    if approx_exponent_v is None:
+        approx_exponent_v = float(smoothness_s)
+    terms = _objective_terms(
+        q=q, m=m, episodes=episodes, horizon=horizon, feature_dim=feature_dim,
+        feedback=feedback, dependence_chi=dependence_chi,
+        stat_exponent_u=stat_exponent_u, approx_exponent_v=float(approx_exponent_v),
+        segment_exponent_gamma=segment_exponent_gamma,
+        stat_constant=stat_constant, approx_constant=approx_constant,
+        segment_constant=segment_constant, selector_norm=selector_norm,
+        kappa_segment_upper_by_m=kappa_segment_upper_by_m,
+        kappa_segment_upper_by_qm=kappa_segment_upper_by_qm,
+        kappa_trajectory_upper=kappa_trajectory_upper, r_max=r_max,
+        segment_cost=segment_cost, critic_compute_cost=critic_compute_cost,
+        cost_penalty=cost_penalty,
+        approx_dimension_exponent=approx_dimension_exponent,
     )
     return {
-        "statistical": float(statistical),
-        "approximation": float(approximation),
-        "segment": float(segment),
-        "feedback_factor": float(factor),
-        "total": float(statistical + approximation + segment),
-        "feature_dim": float(dimension),
+        "statistical": terms["statistical"],
+        "approximation": terms["approximation"],
+        "segment": terms["segment"],
+        "feedback_factor": terms["feedback_factor"],
+        "statistical_rounds": terms["statistical_rounds"],
+        "selector_norm": selector_norm,
+        "query_count": terms["query_count"],
+        "query_cost": terms["query_cost"],
+        "compute_cost": terms["compute_cost"],
+        "objective": terms["objective"],
+        "total": terms["objective"],
+        "feature_dim": terms["dimension"],
     }
 
 
@@ -3766,25 +5550,42 @@ class PolynomialSegmentCritic:
         y = _as_tensor(targets, device=x.device).reshape(-1)
         if x.shape[0] != y.shape[0]:
             raise ValueError("z and targets have incompatible sample counts")
+        weight = None
         if sample_weight is not None:
             weight = _as_tensor(sample_weight, device=x.device).reshape(-1).clamp_min(0)
             if weight.shape != y.shape:
                 raise ValueError("sample_weight shape mismatch")
-            x = x * weight.sqrt().unsqueeze(-1)
-            y = y * weight.sqrt()
         if self.feedback == "sum":
-            gram = x.T @ x + self.ridge_lambda * torch.eye(self.dimension, dtype=x.dtype, device=x.device)
-            self.theta = torch.linalg.solve(gram, x.T @ y)
+            if weight is not None:
+                # Weighted least squares is exactly sqrt-weight scaling.
+                x_fit = x * weight.sqrt().unsqueeze(-1)
+                y_fit = y * weight.sqrt()
+            else:
+                x_fit, y_fit = x, y
+            gram = x_fit.T @ x_fit + self.ridge_lambda * torch.eye(self.dimension, dtype=x.dtype, device=x.device)
+            self.theta = torch.linalg.solve(gram, x_fit.T @ y_fit)
         else:
+            if weight is not None:
+                if torch.any((y < 0) | (y > 1)):
+                    raise ValueError("binary logistic targets must lie in [0, 1]")
+                weight = weight / weight.mean().clamp_min(torch.finfo(weight.dtype).eps)
             theta = torch.zeros(self.dimension, dtype=x.dtype, device=x.device)
             # Newton updates are stable for the small feature spaces used by
             # PolySeg; damping keeps near-separable binary feedback finite.
+            # Sample weights multiply each observation's gradient and Hessian
+            # contribution; they must NOT rescale the binary label.
             for _ in range(self.max_logistic_iter):
                 logits = x @ theta
                 probs = torch.sigmoid(logits)
-                hessian = x.T @ (x * (probs * (1 - probs)).unsqueeze(-1))
+                curvature = probs * (1.0 - probs)
+                if weight is not None:
+                    curvature = curvature * weight
+                    residual = (probs - y) * weight
+                else:
+                    residual = probs - y
+                hessian = x.T @ (x * curvature.unsqueeze(-1))
                 hessian = hessian + self.logistic_l2 * torch.eye(self.dimension, dtype=x.dtype, device=x.device)
-                gradient = x.T @ (probs - y) + self.logistic_l2 * theta
+                gradient = x.T @ residual + self.logistic_l2 * theta
                 step = torch.linalg.solve(hessian, gradient)
                 theta = theta - step
                 if torch.max(torch.abs(step)).item() < 1e-6:
@@ -3847,11 +5648,35 @@ class PolynomialSegmentCritic:
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> "PolynomialSegmentCritic":
+        for name in ("q", "feature_dim", "basis", "feedback"):
+            if name in state and getattr(self, name) != state[name]:
+                raise ValueError(f"critic state {name} does not match configured critic")
+        for name in ("ridge_lambda", "logistic_l2"):
+            if name in state:
+                value = float(state[name])
+                expected = getattr(self, name)
+                if not math.isfinite(value) or value <= 0 or not math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(f"critic state {name} does not match configured critic")
+        if "normalized_basis" in state and bool(state["normalized_basis"]) != self.normalized_basis:
+            raise ValueError("critic normalized-basis setting does not match configured critic")
         self.theta = None if state.get("theta") is None else _as_tensor(state["theta"])
+        if self.theta is not None and (self.theta.shape != (self.dimension,) or not torch.isfinite(self.theta).all()):
+            raise ValueError("invalid critic parameter vector")
         sufficient_state = state.get("sufficient_state")
         self._sufficient_state = (
             None if sufficient_state is None else PolynomialEstimatorState.from_state_dict(sufficient_state)
         )
+        if self._sufficient_state is not None and (
+            self._sufficient_state.q != self.q
+            or self._sufficient_state.feature_dim != self.feature_dim
+            or self._sufficient_state.basis != self.basis
+            or self._sufficient_state.normalized_basis != self.normalized_basis
+            or not math.isclose(self._sufficient_state.ridge_lambda, self.ridge_lambda, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ValueError("critic sufficient state configuration does not match")
+        expected_feedback = "local_sum" if self.feedback == "sum" else "binary_local"
+        if self._sufficient_state is not None and self._sufficient_state.feedback != expected_feedback:
+            raise ValueError("critic sufficient state feedback does not match configured critic")
         self.design = None
         self.targets = None
         return self
@@ -3982,6 +5807,9 @@ def compute_polyseg_advantage_registered(
         segment_features=_extract_polyseg_field(batch, "segment_features")
         if _extract_polyseg_field(batch, "segment_features") is not None
         else _extract_polyseg_field(non_tensor_batch, "segment_features"),
+        step_features=_extract_polyseg_field(batch, "step_features")
+        if _extract_polyseg_field(batch, "step_features") is not None
+        else _extract_polyseg_field(non_tensor_batch, "step_features"),
     )
 
 
