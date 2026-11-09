@@ -49,6 +49,8 @@ def _strict_validate_flag(value: Any) -> bool:
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+    # Greedy REMAX baselines are used for their rewards, not score-centering training heads.
+    params.pop("topk_log_probs", None)
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
