@@ -175,6 +175,20 @@ def _science_config(config: Any) -> Any:
     return _config_value(polyseg, "science", None)
 
 
+def science_execution_owner(config: Any) -> str:
+    """Return the configured owner of mutable science-round execution.
+
+    The default remains ``worker`` for compatibility.  A driver-owned runtime
+    must opt into ``driver`` so one manager, rather than each Ray worker,
+    mutates query-sampler, dependence, and budget state.
+    """
+
+    owner = str(_config_value(_science_config(config), "execution_owner", "worker") or "worker")
+    if owner not in {"worker", "driver"}:
+        raise ValueError("PolySeg-Sci execution_owner must be worker or driver")
+    return owner
+
+
 def science_enabled(config: Any) -> bool:
     algorithm = _config_value(config, "algorithm", config)
     estimator = str(_config_value(algorithm, "adv_estimator", ""))
@@ -247,6 +261,108 @@ def attach_science_response(outputs: Sequence[Any], response: ScienceRoundRespon
         extra_fields["science_research_eligible"] = eligible
 
 
+def attach_science_response_to_batch(batch: Any, index: int, response: ScienceRoundResponse) -> None:
+    """Attach one driver-executed response to a row of an aggregated batch.
+
+    Ray workers normally attach fields to ``AgentLoopOutput`` before padding.
+    Driver-owned execution happens after worker aggregation, where only the
+    serialized ``extra_fields`` object array is available.  Keep this helper
+    explicit so a driver cannot accidentally mutate a different row or lose
+    the final eligibility/audit envelope.
+    """
+
+    non_tensor = getattr(batch, "non_tensor_batch", None)
+    if not isinstance(non_tensor, Mapping):
+        raise TypeError("driver science attachment requires batch.non_tensor_batch")
+    extras = non_tensor.get("extra_fields")
+    if extras is None or not hasattr(extras, "__len__"):
+        raise ValueError("driver science attachment requires serialized extra_fields rows")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= len(extras):
+        raise IndexError("driver science row index is outside the batch")
+    row = extras[index]
+    row = dict(row) if isinstance(row, Mapping) else {}
+    eligible = response.research_eligible
+    audit = dict(response.audit)
+    if eligible and _correction_audit(audit).get("unbiased_under_response_model") is not True:
+        eligible = False
+        audit.setdefault("research_eligibility_rejection", "response_model_not_validated")
+    for key, value in response.fields.items():
+        if isinstance(value, np.ndarray):
+            value = np.array(value, copy=True)
+        elif isinstance(value, torch.Tensor):
+            value = value.detach().cpu().clone()
+        row[key] = value
+    row["science_round_audit"] = audit
+    row["science_research_eligible"] = eligible
+    extras[index] = row
+
+
+def materialize_science_batch_fields(batch: Any) -> None:
+    """Pack driver-attached ragged science fields into padded TensorDict axes."""
+
+    non_tensor = getattr(batch, "non_tensor_batch", None)
+    tensor_batch = getattr(batch, "batch", None)
+    if not isinstance(non_tensor, Mapping) or tensor_batch is None:
+        raise TypeError("science batch materialization requires DataProto-like batch")
+    extras = non_tensor.get("extra_fields")
+    if extras is None or len(extras) == 0:
+        raise ValueError("science batch materialization requires extra_fields rows")
+    rows = [item if isinstance(item, Mapping) else {} for item in extras]
+    required = tuple(SCIENCE_FIELD_NAMES)
+    if any(any(key not in row for key in required) for row in rows):
+        raise ValueError("driver science provider did not return a complete field envelope for every row")
+    values = [torch.as_tensor(row["science_boundary_values"], dtype=torch.float32) for row in rows]
+    if any(value.ndim != 2 or value.shape[0] < 2 or not torch.isfinite(value).all() for value in values):
+        raise ValueError("driver science boundary values are not finite [segments+1,endpoints]")
+    endpoint_dim = int(values[0].shape[1])
+    if any(int(value.shape[1]) != endpoint_dim for value in values):
+        raise ValueError("driver science endpoint dimensions differ across rows")
+    max_boundaries = max(int(value.shape[0]) for value in values)
+    padded_values: list[torch.Tensor] = []
+    padded_boundary_masks: list[torch.Tensor] = []
+    padded_endpoint_masks: list[torch.Tensor] = []
+    for row, value in zip(rows, values, strict=True):
+        boundary_mask = torch.as_tensor(row["science_boundary_mask"], dtype=torch.bool).reshape(-1)
+        endpoint_mask = torch.as_tensor(row["science_endpoint_mask"], dtype=torch.bool)
+        segment_mask = torch.as_tensor(row["segment_mask"], dtype=torch.bool).reshape(-1)
+        if boundary_mask.numel() != value.shape[0] - 1 or segment_mask.numel() != value.shape[0] - 1:
+            raise ValueError("driver science boundary/segment masks do not align")
+        if endpoint_mask.shape != value.shape:
+            raise ValueError("driver science endpoint mask does not align")
+        pad_rows = max_boundaries - int(value.shape[0])
+        if pad_rows:
+            value = torch.cat((value, value[-1:].expand(pad_rows, -1)), dim=0)
+            endpoint_mask = torch.cat(
+                (endpoint_mask, torch.zeros(pad_rows, endpoint_dim, dtype=torch.bool)), dim=0
+            )
+            boundary_mask = torch.cat((boundary_mask, torch.zeros(pad_rows, dtype=torch.bool)), dim=0)
+        padded_values.append(value)
+        padded_boundary_masks.append(boundary_mask)
+        padded_endpoint_masks.append(endpoint_mask)
+    tensor_batch["science_boundary_values"] = torch.stack(padded_values, dim=0)
+    tensor_batch["science_boundary_mask"] = torch.stack(padded_boundary_masks, dim=0)
+    tensor_batch["science_endpoint_mask"] = torch.stack(padded_endpoint_masks, dim=0)
+    # The estimator accepts segment IDs from either axis.  Driver execution
+    # must provide the token-aligned form when the workers did not already
+    # materialize it (for example, after a custom rollout adapter).
+    response_width = int(tensor_batch["responses"].shape[1])
+    padded_ids = []
+    for row in rows:
+        ids = torch.as_tensor(row["segment_ids"], dtype=torch.long).reshape(-1)
+        if ids.numel() > response_width:
+            raise ValueError("driver science segment_ids exceed response width")
+        padded = torch.full((response_width,), -1, dtype=torch.long)
+        padded[: ids.numel()] = ids
+        padded_ids.append(padded)
+    serialized_ids = torch.stack(padded_ids, dim=0)
+    if "segment_ids" in tensor_batch.keys():
+        existing_ids = torch.as_tensor(tensor_batch["segment_ids"], dtype=torch.long)
+        if existing_ids.shape != serialized_ids.shape or not torch.equal(existing_ids, serialized_ids):
+            raise ValueError("driver science segment_ids disagree with worker token metadata")
+    else:
+        tensor_batch["segment_ids"] = serialized_ids
+
+
 __all__ = [
     "SCIENCE_FIELD_NAMES",
     "ScienceRoundRequest",
@@ -255,6 +371,9 @@ __all__ = [
     "DisabledScienceRoundProvider",
     "CallbackScienceRoundProvider",
     "load_science_round_provider",
+    "science_execution_owner",
     "science_enabled",
     "attach_science_response",
+    "attach_science_response_to_batch",
+    "materialize_science_batch_fields",
 ]

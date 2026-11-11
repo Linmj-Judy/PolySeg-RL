@@ -1201,6 +1201,21 @@ class RayPPOTrainer:
             torch.save(controller.state_dict(), os.path.join(local_global_step_folder, "polyseg_controller.pt"))
             print("Saved PolySeg adaptive selector state")
 
+        science_manager = getattr(self, "agent_loop_manager", None)
+        if science_manager is None:
+            science_manager = getattr(self, "async_rollout_manager", None)
+        science_state_getter = getattr(science_manager, "get_science_checkpoint_state", None)
+        if callable(science_state_getter):
+            science_state = science_state_getter()
+            if science_state is not None:
+                if hasattr(science_state, "complete") and not science_state.complete:
+                    raise RuntimeError(
+                        "PolySeg-Sci checkpoint is incomplete: register a fitted predictor, evaluator hashes, and RNG state"
+                    )
+                state_dict = science_state.state_dict() if hasattr(science_state, "state_dict") else science_state
+                torch.save(state_dict, os.path.join(local_global_step_folder, "science_checkpoint.pt"))
+                print("Saved complete PolySeg-Sci checkpoint state")
+
         ledger_path = configured_feedback_ledger_path(self.config)
         if ledger_path is not None:
             ledger_snapshot_path = os.path.join(local_global_step_folder, "polyseg_feedback_ledger.json")
@@ -1295,6 +1310,17 @@ class RayPPOTrainer:
 
             manager.polyseg_controller = BudgetedPolySegController.from_state_dict(state)
             print("Restored PolySeg adaptive selector state")
+
+        science_checkpoint_path = os.path.join(global_step_folder, "science_checkpoint.pt")
+        if os.path.exists(science_checkpoint_path):
+            manager = getattr(self, "agent_loop_manager", None)
+            if manager is None:
+                manager = getattr(self, "async_rollout_manager", None)
+            setter = getattr(manager, "set_science_checkpoint_state", None)
+            if setter is None:
+                raise RuntimeError("checkpoint contains complete science state but manager cannot restore it")
+            setter(torch.load(science_checkpoint_path, weights_only=False))
+            print("Restored complete PolySeg-Sci checkpoint state")
 
         ledger_path = configured_feedback_ledger_path(self.config)
         journal_path = configured_feedback_journal_path(self.config)

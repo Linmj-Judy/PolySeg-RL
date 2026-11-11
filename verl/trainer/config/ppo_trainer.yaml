@@ -105,17 +105,41 @@ algorithm:
       endpoint_schema_hash: ""
       feature_map_path: ""
       feature_map_hash: ""
+      fidelity_feature_map_path: ""
+      fidelity_feature_map_hash: ""
       provider_path: ""
+      execution_owner: worker
+      round_factory_path: ""
       segment_rule: fixed_action_tokens
       segment_rule_version: polyseg-sci-causal-boundary-v1
+      max_segments: 8
+      min_action_tokens: 8
+      max_action_tokens: 512
+      require_causal_boundary: True
+      representation_source: frozen_hidden_projection
+      projection_dim: 8
+      normalize_to_unit_interval: True
+      freeze_before_rl: True
+      cross_fit_by: trajectory
+      fit_on_prior_batches: True
+      stop_gradient: True
       query_mode: uniform
       hard_budget: False
+      budget_mode: expected
+      min_inclusion_probability: 0.0
+      record_joint_inclusion_probability: True
+      response_model: audited
       train_budget: null
+      ledger_path: ""
       predictor_q: 2
       predictor_basis: total
       predictor_ridge_lambda: 1.0
       branch_count: 1
       require_restore_audit: True
+      require_full_state_contract: True
+      require_independent_rng: True
+      inherit_remaining_execution_budget: True
+      fail_closed: True
       policy_update: preference
       normalize_advantages: False
       endpoint_weights: null

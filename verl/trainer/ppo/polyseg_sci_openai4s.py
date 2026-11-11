@@ -31,6 +31,7 @@ from verl.trainer.ppo.polyseg_sci import (
     EvaluatorExecutionError,
     BranchExecutionError,
     FeatureMapContract,
+    FidelityFeatureMapContract,
     FreshBranchRunner,
     RESTORE_EVIDENCE_KINDS,
     RestoreAudit,
@@ -186,11 +187,13 @@ class OpenAI4STrajectoryAdapter:
         feature_map: FeatureMapContract,
         *,
         segmenter: CausalSegmenter,
+        fidelity_feature_map: FidelityFeatureMapContract | None = None,
         state_oracle: StateAuditOracle | None = None,
         restore_contract_version: str = RESTORE_CONTRACT_VERSION,
     ) -> None:
         self.schema = schema
         self.feature_map = feature_map
+        self.fidelity_feature_map = fidelity_feature_map
         self.segmenter = segmenter
         self.state_oracle = state_oracle or StateAuditOracle()
         self.restore_contract_version = restore_contract_version

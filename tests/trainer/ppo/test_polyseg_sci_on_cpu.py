@@ -24,6 +24,8 @@ from verl.trainer.ppo.polyseg_sci import (
     EndpointSchema,
     EndpointSpec,
     FeatureMapContract,
+    FidelityFeatureMapContract,
+    load_fidelity_feature_map_contract,
     load_feature_map_contract,
     FidelitySpec,
     FreshBranchRunner,
@@ -46,10 +48,17 @@ from verl.trainer.ppo.polyseg_sci import (
     residual_correct,
     segment_score_gradient,
     parameter_score_gradients,
+    ScoreGradientSketcher,
     compute_polyseg_science_advantage,
     compute_polyseg_science_advantage_registered,
     ScientificEndpointEvaluator,
     ConstraintDualState,
+    BoundaryRisk,
+    compute_boundary_risk,
+    compute_gradient_risk_covariance,
+    estimate_boundary_error_covariance,
+    AuditDesign,
+    BernoulliRiskAllocator,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.utils import tensordict_utils as tu
@@ -94,6 +103,21 @@ def test_feature_map_contract_roundtrip_and_hash_guard(tmp_path):
         load_feature_map_contract(path, expected_hash="0" * 64)
     with pytest.raises(ValueError, match="HF fidelity"):
         FidelitySpec("bad", "HF", "proxy", "v1", 1.0, kind="proxy")
+
+
+def test_fidelity_feature_map_loader_roundtrip_and_hash_guard(tmp_path):
+    slots = ("activity::activity-lf", "stability::stability-lf")
+    contract = FidelityFeatureMapContract.fit(
+        [[0.1, 20.0], [0.8, 60.0]],
+        [[True, True], [True, True]],
+        slots,
+    )
+    path = tmp_path / "fidelity_feature_map.json"
+    path.write_text(json.dumps(contract.to_dict()), encoding="utf-8")
+    restored = load_fidelity_feature_map_contract(path, expected_hash=contract.fingerprint)
+    assert restored.to_dict() == contract.to_dict()
+    with pytest.raises(ValueError, match="fidelity_feature_map_hash"):
+        load_fidelity_feature_map_contract(path, expected_hash="0" * 64)
 
 
 def test_endpoint_schema_json_round_trip_preserves_fidelity_contract():
@@ -214,8 +238,51 @@ def test_frozen_feature_map_and_multioutput_crossfit():
     assert predictor.diagnostics()["endpoint_dimension"] == 2
     state = predictor.state_dict()
     assert state["feature_map"]["version"] == fmap.version
+
+
+def test_fidelity_features_and_masks_enter_frozen_predictor_and_checkpoint():
+    schema = _schema()
+    fmap = FeatureMapContract.fit([[0.0], [1.0], [0.5]], ["progress"])
+    slots = ("activity::activity-lf", "stability::stability-lf")
+    values = [[0.1, 20.0], [0.8, 60.0], [0.4, 40.0]]
+    mask = [[True, True], [True, False], [False, True]]
+    fidelity_map = FidelityFeatureMapContract.fit(values, mask, slots)
+    predictor = PolynomialVectorPredictor(schema, fmap, q=1, fidelity_feature_map=fidelity_map)
+    predictor.fit(
+        [[0.0], [0.5], [1.0]],
+        [[0.2, 20.0], [0.5, 40.0], [0.9, 60.0]],
+        fidelity_values=values,
+        fidelity_mask=mask,
+    )
+    full = predictor.predict([[0.25]], [[0.2, 30.0]], [[True, True]])
+    missing = predictor.predict([[0.25]], [[0.0, 0.0]], [[False, False]])
+    assert full.shape == (1, schema.dimension)
+    assert missing.shape == full.shape
+    state = predictor.state_dict()
+    restored = PolynomialVectorPredictor.from_state_dict(state)
+    assert restored.fidelity_feature_map is not None
+    torch.testing.assert_close(
+        restored.predict([[0.25]], [[0.2, 30.0]], [[True, True]]),
+        full,
+    )
+
+
+def test_fidelity_feature_contract_rejects_unknown_slot_order_and_missing_mask():
+    schema = _schema()
+    fmap = FeatureMapContract.fit([[0.0], [1.0]], ["progress"])
+    with pytest.raises(ValueError, match="slots"):
+        PolynomialVectorPredictor(
+            schema,
+            fmap,
+            q=0,
+            fidelity_feature_map=FidelityFeatureMapContract.fit(
+                [[0.0, 0.0], [1.0, 1.0]],
+                [[True, True], [True, True]],
+                ["stability::stability-lf", "activity::activity-lf"],
+            ),
+        )
     with pytest.raises(ValueError, match="non-finite"):
-        fmap.transform([[float("inf"), 0.0]])
+        fmap.transform([[float("inf")]])
 
 
 def test_cross_fit_fails_closed_when_a_fold_has_no_endpoint_training_data():
@@ -263,8 +330,94 @@ def test_hard_budget_sampler_records_first_and_second_order_propensity():
     assert all(math.isclose(p, 0.5) for p in decision.inclusion_probabilities.values())
     assert all(math.isclose(p, 1 / 6) for p in decision.pair_inclusion_probabilities.values())
     assert decision.planned_cost == 4.0
-    with pytest.raises(ValueError, match="equal candidate costs"):
-        BudgetedQuerySampler().sample((candidates[0], QueryCandidate("b9", "activity", 1, 1, 1, 3.0)), 3, hard_budget=True)
+    adaptive_equal = BudgetedQuerySampler().sample(
+        candidates, 4.0, mode="adaptive", hard_budget=True, seed=7
+    )
+    assert all(0 < value <= 1 for value in adaptive_equal.inclusion_probabilities.values())
+    assert adaptive_equal.planned_cost <= 4.0
+    unequal = (candidates[0], QueryCandidate("b9", "activity", 1, 1, 1, 3.0))
+    unequal_decision = BudgetedQuerySampler().sample(unequal, 3, hard_budget=True, seed=7)
+    assert unequal_decision.inclusion_probabilities["b0::activity"] == pytest.approx(1 / 3)
+    assert unequal_decision.inclusion_probabilities["b9::activity"] == pytest.approx(1 / 3)
+    assert unequal_decision.pair_inclusion_probabilities["b0::activity::b9::activity"] == pytest.approx(0.0)
+    assert unequal_decision.planned_cost in {0.0, 2.0, 3.0}
+    adaptive_unequal = BudgetedQuerySampler().sample(unequal, 3, mode="adaptive", seed=7)
+    assert all(value > 0 for value in adaptive_unequal.inclusion_probabilities.values())
+    with pytest.raises(ValueError, match="exact-enumeration limit"):
+        BudgetedQuerySampler().sample(
+            tuple(QueryCandidate(f"b{i}", "activity", 1, 1, 1, 1 + i % 2) for i in range(19)),
+            5,
+            hard_budget=True,
+        )
+
+
+def test_query_sampler_enforces_minimum_inclusion_probability():
+    candidates = (
+        QueryCandidate("a", "activity", 0.0, 0.0, 1.0, 1.0),
+        QueryCandidate("b", "activity", 4.0, 1.0, 1.0, 1.0),
+    )
+    decision = BudgetedQuerySampler().sample(
+        candidates,
+        0.4,
+        mode="adaptive",
+        min_inclusion_probability=0.2,
+        seed=4,
+    )
+    assert decision.inclusion_probabilities["a::activity"] == pytest.approx(0.2)
+    assert decision.inclusion_probabilities["b::activity"] >= 0.2
+    assert sum(
+        candidate.cost * decision.inclusion_probabilities[BudgetedQuerySampler._key(candidate)]
+        for candidate in candidates
+    ) <= 0.4 + 1e-8
+    with pytest.raises(ValueError, match="minimum inclusion probability"):
+        BudgetedQuerySampler().sample(
+            candidates,
+            0.39,
+            min_inclusion_probability=0.2,
+        )
+
+
+def test_adaptive_sampler_uses_clipped_kkt_floor_directly():
+    candidates = (
+        QueryCandidate("high", "activity", 4.0, 1.0, 1.0, 1.0),
+        QueryCandidate("low", "activity", 1.0, 1.0, 1.0, 1.0),
+    )
+    decision = BudgetedQuerySampler().sample(
+        candidates,
+        0.6,
+        mode="adaptive",
+        min_inclusion_probability=0.2,
+        seed=3,
+    )
+    # The solution to p_i = clip(scale * sqrt(risk_i / cost_i), .2, 1)
+    # spends the budget at p=(.4, .2).  Adding the floor to every residual
+    # allocation would incorrectly produce (.333..., .266...).
+    assert decision.inclusion_probabilities == pytest.approx(
+        {"high::activity": 0.4, "low::activity": 0.2}
+    )
+    assert sum(
+        candidate.cost * decision.inclusion_probabilities[BudgetedQuerySampler._key(candidate)]
+        for candidate in candidates
+    ) == pytest.approx(0.6)
+
+
+def test_hard_budget_minimum_inclusion_probability_is_fail_closed():
+    candidates = tuple(QueryCandidate(f"b{i}", "activity", 1.0, 1.0, 1.0, 1.0) for i in range(4))
+    decision = BudgetedQuerySampler().sample(
+        candidates,
+        2.0,
+        hard_budget=True,
+        min_inclusion_probability=0.5,
+        seed=9,
+    )
+    assert all(value == pytest.approx(0.5) for value in decision.inclusion_probabilities.values())
+    with pytest.raises(ValueError, match="minimum inclusion probability"):
+        BudgetedQuerySampler().sample(
+            candidates,
+            2.0,
+            hard_budget=True,
+            min_inclusion_probability=0.75,
+        )
 
 
 def test_adaptive_sampler_uses_square_root_gradient_risk_allocation():
@@ -702,10 +855,17 @@ def test_science_round_orchestrates_restore_query_correction_gradient_and_verifi
     assert result.corrected_boundary_values.shape == (4, 2)
     assert result.segment_gradient.shape == (2, 2)
     assert len(result.boundary_records) == 2
+    assert result.boundary_records[0].branch_count["activity"] == 2
     assert result.ledger["spent"] > 0
     assert result.ledger["consumed"]["audit"] == pytest.approx(1.0)
     assert set(result.covariance_by_boundary) == {"b0", "b1"}
     assert result.audit["covariance_by_boundary"] == result.covariance_by_boundary
+    assert set(result.audit["gradient_risk_by_query"]) == {
+        f"{boundary_id}::{endpoint_id}"
+        for boundary_id in actions
+        for endpoint_id in schema.endpoint_ids
+    }
+    assert result.boundary_records[0].gradient_risk["activity"]["estimated_gradient_risk"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("field,value", [("query_budget", True), ("terminal_cost", "1.0"), ("restore_cost", True), ("audit_cost", "0.1"), ("planned_branch_cost", True), ("branch_count", 1.5)])
@@ -818,6 +978,31 @@ def test_science_round_keeps_selected_endpoint_when_other_vector_dimension_is_mi
     assert result.observations["b0::activity"].value == pytest.approx(0.8)
     assert "b0::stability" not in result.observations
     assert result.boundary_records[0].valid_observation["activity"] is True
+
+
+def test_science_round_requires_complete_candidate_coverage_for_positive_floor():
+    kwargs = _science_round_contract_kwargs()
+    kwargs["min_inclusion_probability"] = 0.1
+    with pytest.raises(ValueError, match="every internal endpoint boundary"):
+        run_science_round(**kwargs)
+
+
+def test_science_round_rejects_mixed_branch_counts_within_boundary():
+    kwargs = _science_round_contract_kwargs()
+    kwargs["candidates"] = (
+        QueryCandidate("b0", "activity", 1.0, 1.0, 1.0, 1.0, branch_count=2),
+        QueryCandidate("b0", "stability", 1.0, 1.0, 1.0, 1.0, branch_count=3),
+    )
+    kwargs["query_budget"] = 2.0
+    with pytest.raises(ValueError, match="share branch_count"):
+        run_science_round(**kwargs)
+
+
+def test_science_round_rejects_external_branch_count_contract_mismatch():
+    kwargs = _science_round_contract_kwargs()
+    kwargs["branch_counts_by_boundary"] = {"b0": 2}
+    with pytest.raises(ValueError, match="do not match branch_counts_by_boundary"):
+        run_science_round(**kwargs)
 
 
 def test_science_round_reserves_budget_before_callbacks():
@@ -1025,6 +1210,43 @@ def test_parameter_score_gradients_restores_mixed_child_training_modes():
     assert model.training is True
     assert model.embedding.training is False
     assert model.proj.training is True
+
+
+def test_score_gradient_sketcher_is_deterministic_and_validates_projection():
+    torch.manual_seed(12)
+    model = _TinyCausalLM()
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    exact = parameter_score_gradients(
+        model, ids, response_start=2, segment_ranges=[(0, 2), (2, 4)],
+        parameter_names=["proj.weight", "proj.bias"],
+    )
+    first = ScoreGradientSketcher(3, seed=19, parameter_prefix="proj", checkpoint_hash="actor-hash").fit(model)
+    second = ScoreGradientSketcher(3, seed=19, parameter_prefix="proj", checkpoint_hash="actor-hash").fit(model)
+    projected = first.project(exact)
+    torch.testing.assert_close(projected, second.project(exact))
+    assert first.parameter_names is None
+    assert first._fitted_parameter_names == ("proj.weight", "proj.bias")
+    report = first.validate(exact)
+    assert report["validated"] is True
+    assert report["parameter_dimension"] == exact.shape[1]
+    assert report["projection_dimension"] == 3
+    scores = first.score(model, ids, response_start=2, segment_ranges=[(0, 2), (2, 4)])
+    torch.testing.assert_close(scores, projected)
+
+
+def test_score_gradient_sketcher_state_roundtrip_and_rejects_invalid_payloads():
+    model = _TinyCausalLM()
+    sketch = ScoreGradientSketcher(2, seed=5, parameter_names=["proj.bias"]).fit(model)
+    restored = ScoreGradientSketcher.from_state_dict(sketch.state_dict())
+    assert restored.parameter_names == ("proj.bias",)
+    assert restored._fitted_parameter_names == ("proj.bias",)
+    torch.testing.assert_close(restored.project(torch.ones(2, model.proj.bias.numel())), sketch.project(torch.ones(2, model.proj.bias.numel())))
+    bad = sketch.state_dict()
+    bad["projection"] = [[float("nan")]]
+    with pytest.raises(ValueError, match="invalid score sketch projection"):
+        ScoreGradientSketcher.from_state_dict(bad)
+    with pytest.raises(ValueError, match="unsupported score sketch checkpoint"):
+        ScoreGradientSketcher.from_state_dict({"version": "old"})
 
 
 def test_pareto_preference_and_constraint_directions_are_explicit():
@@ -1408,8 +1630,17 @@ def test_real_actor_loss_uses_global_macro_denominator(monkeypatch):
 def test_science_config_is_explicit_and_validated():
     cfg = PolySegScienceConfig(enabled=True, objective_mode="pareto", query_mode="adaptive", hard_budget=True, train_budget=12, branch_count=2)
     assert cfg.enabled and cfg.objective_mode == "pareto" and cfg.branch_count == 2
+    assert cfg.representation_source == "frozen_hidden_projection"
+    assert cfg.cross_fit_by == "trajectory" and cfg.require_full_state_contract
+    with pytest.raises(ValueError, match="budget_mode"):
+        PolySegScienceConfig(budget_mode="unbounded")
+    with pytest.raises(ValueError, match="action_tokens"):
+        PolySegScienceConfig(min_action_tokens=20, max_action_tokens=4)
     with pytest.raises(ValueError, match="objective_mode"):
         PolySegScienceConfig(objective_mode="posthoc")
+    assert PolySegScienceConfig(execution_owner="driver").execution_owner == "driver"
+    with pytest.raises(ValueError, match="execution_owner"):
+        PolySegScienceConfig(execution_owner="ray")
 
 
 def test_legacy_policy_update_alias_resolves_to_effective_science_mode():
@@ -1462,6 +1693,54 @@ def test_agent_loop_manager_initializes_and_restores_schema_bound_duals(tmp_path
     restored = manager.set_science_dual_state(payload)
     assert restored.update_count == 1
     torch.testing.assert_close(restored.multipliers, updated)
+
+
+def test_agent_loop_manager_loads_configured_fidelity_feature_map(tmp_path, monkeypatch):
+    schema = _schema("preference")
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(json.dumps(schema.to_dict()), encoding="utf-8")
+    feature_map = FeatureMapContract.fit([[0.0], [1.0]], ["progress"])
+    feature_path = tmp_path / "feature_map.json"
+    feature_path.write_text(json.dumps(feature_map.to_dict()), encoding="utf-8")
+    slots = ("activity::activity-lf", "stability::stability-lf")
+    fidelity_map = FidelityFeatureMapContract.fit(
+        [[0.1, 20.0], [0.8, 60.0]],
+        [[True, True], [True, True]],
+        slots,
+    )
+    fidelity_path = tmp_path / "fidelity_feature_map.json"
+    fidelity_path.write_text(json.dumps(fidelity_map.to_dict()), encoding="utf-8")
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"model": {}, "rollout": {"agent": {"num_workers": 0}}},
+            "algorithm": {
+                "adv_estimator": "polyseg_sci",
+                "polyseg": {
+                    "science": {
+                        "enabled": True,
+                        "objective_mode": "preference",
+                        "endpoint_schema_path": str(schema_path),
+                        "endpoint_schema_hash": schema.fingerprint,
+                        "feature_map_path": str(feature_path),
+                        "feature_map_hash": feature_map.fingerprint,
+                        "fidelity_feature_map_path": str(fidelity_path),
+                        "fidelity_feature_map_hash": fidelity_map.fingerprint,
+                        "train_budget": 10.0,
+                    }
+                },
+            },
+        }
+    )
+    monkeypatch.setattr(AgentLoopManager, "agent_loop_workers_class", object(), raising=False)
+    manager = AgentLoopManager(config, llm_client=None)
+    assert manager.science_checkpoint_state is not None
+    assert manager.science_checkpoint_state.fidelity_feature_map is not None
+    assert manager.science_checkpoint_state.fidelity_feature_map.fingerprint == fidelity_map.fingerprint
+
+    bad_config = OmegaConf.create(config)
+    bad_config.algorithm.polyseg.science.fidelity_feature_map_hash = "0" * 64
+    with pytest.raises(ValueError, match="fidelity_feature_map_hash"):
+        AgentLoopManager(bad_config, llm_client=None)
 
 
 def test_science_advantage_is_a_fail_closed_vector_to_token_adapter():
@@ -1662,3 +1941,205 @@ def test_scientific_evaluator_preserves_missingness_metadata_on_rebuild(status):
     assert rebuilt.replicate_id == "rep-7"
     assert rebuilt.cost == 0.25
     schema.validate_observation(rebuilt, allow_empty_provenance=False)
+
+
+def test_boundary_risk_exposes_explicit_alpha_beta_and_design_risk():
+    risk = compute_boundary_risk(
+        boundary_id="b0",
+        W_b=[2.0, -1.0],
+        residual_vector=[0.5, -0.25],
+        branch_covariance=[[4.0, 1.0], [1.0, 2.0]],
+        branch_counts=[1, 2, 4],
+        cost_by_n={1: 3.0, 2: 5.0, 4: 9.0},
+        inclusion_probability=0.5,
+        assumptions=["OOF residual", "conditional branch covariance"],
+    )
+    assert isinstance(risk, BoundaryRisk)
+    assert risk.alpha == pytest.approx(1.5625)
+    assert risk.beta_by_n[1] == pytest.approx(30.0)
+    assert risk.beta_by_n[2] == pytest.approx(15.0)
+    assert risk.risk_by_n[2] == pytest.approx(31.5625)
+    assert risk.cost_by_n[4] == pytest.approx(9.0)
+    assert risk.valid is True
+    assert risk.to_dict()["beta_by_n"]["2"] == pytest.approx(15.0)
+
+
+def test_boundary_risk_rejects_non_psd_covariance_and_zero_propensity():
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        compute_boundary_risk(
+            W_b=[1.0], residual_vector=[1.0], branch_covariance=[[-1.0]],
+        )
+    with pytest.raises(ValueError, match=r"in \(0,1\]"):
+        compute_boundary_risk(
+            W_b=[1.0], residual_vector=[1.0], branch_covariance=[[1.0]],
+            inclusion_probability=0.0,
+        )
+
+
+def test_boundary_risk_uses_methods_column_vectorization():
+    metric = torch.diag(torch.tensor([1.0, 10.0, 100.0, 1000.0], dtype=torch.float64))
+    risk = compute_boundary_risk(
+        W_b=[[1.0, 2.0], [3.0, 4.0]],
+        residual_vector=[3.0, 4.0],
+        branch_covariance=torch.zeros((2, 2), dtype=torch.float64),
+        gradient_metric=metric,
+    )
+    # vec(delta G) = [1*3, 3*4, 2*3, 4*4] for endpoint-specific W \otimes I_R.
+    assert risk.alpha == pytest.approx(261049.0)
+
+
+def test_gradient_risk_covariance_preserves_cross_boundary_blocks():
+    covariance = compute_gradient_risk_covariance(
+        sensitivities=[[1.0, 0.0], [0.0, 2.0]],
+        boundary_covariances=[[[1.0]], [[2.0]]],
+        cross_boundary_covariances={(1, 0): [[0.5]]},
+    )
+    assert covariance.shape == (2, 2)
+    torch.testing.assert_close(covariance, torch.tensor([[1.0, 1.0], [1.0, 8.0]], dtype=torch.float64))
+
+
+def test_gradient_risk_covariance_rejects_non_psd_boundary_block():
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        compute_gradient_risk_covariance(
+            sensitivities=[[1.0]],
+            boundary_covariances=[[[-1.0]]],
+        )
+
+
+def test_boundary_risk_rejects_mismatched_branch_count_maps():
+    risk = compute_boundary_risk(
+        boundary_id="b0",
+        W_b=[1.0],
+        residual_vector=[0.5],
+        branch_covariance=[[0.25]],
+        branch_counts=[1, 2],
+    )
+    with pytest.raises(ValueError, match="share the same branch-count keys"):
+        BoundaryRisk(
+            boundary_id=risk.boundary_id,
+            alpha=risk.alpha,
+            beta_by_n=risk.beta_by_n,
+            risk_by_n={1: risk.risk_by_n[1]},
+            cost_by_n=risk.cost_by_n,
+            sensitivity_norm=risk.sensitivity_norm,
+            residual_norm=risk.residual_norm,
+            covariance_trace=risk.covariance_trace,
+            valid=True,
+        )
+
+
+def test_query_candidate_round_trips_integer_risk_keys():
+    candidate = QueryCandidate(
+        "b0", "activity", 1.0, 1.0, 1.0, 2.0, branch_count=2,
+        alpha=3.0, beta_by_n={1: 4.0, 2: 2.0},
+        risk_by_n={1: 7.0, 2: 5.0}, cost_by_n={1: 2.0, 2: 3.0},
+    )
+    restored = QueryCandidate.from_dict(candidate.to_dict())
+    assert restored == candidate
+    assert restored.estimated_gradient_risk == pytest.approx(5.0)
+
+
+def test_bernoulli_risk_allocator_solves_budget_and_selects_branch_count():
+    risks = {
+        "b0": compute_boundary_risk(
+            boundary_id="b0", W_b=[1.0], residual_vector=[1.0],
+            branch_covariance=[[4.0]], branch_counts=[1, 2],
+            cost_by_n={1: 1.0, 2: 1.5},
+        ),
+        "b1": compute_boundary_risk(
+            boundary_id="b1", W_b=[2.0], residual_vector=[0.5],
+            branch_covariance=[[1.0]], branch_counts=[1, 2],
+            cost_by_n={1: 1.0, 2: 1.5},
+        ),
+    }
+    design = BernoulliRiskAllocator.allocate(risks, budget=1.5, p_min=0.25, seed=9)
+    assert isinstance(design, AuditDesign)
+    assert design.status == "feasible"
+    assert design.expected_cost <= 1.5 + 1e-8
+    assert all(value >= 0.25 for value in design.probabilities.values())
+    assert set(design.pair_probabilities) == {"b0::b1"}
+    infeasible = BernoulliRiskAllocator.allocate(risks, budget=0.1, p_min=0.25)
+    assert infeasible.status == "infeasible_budget"
+
+
+def test_bernoulli_allocator_uses_clipped_kkt_floor_directly():
+    high = compute_boundary_risk(
+        boundary_id="high", W_b=[2.0], residual_vector=[1.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    low = compute_boundary_risk(
+        boundary_id="low", W_b=[1.0], residual_vector=[1.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    design = BernoulliRiskAllocator.allocate(
+        {"high": high, "low": low}, budget=0.6, p_min=0.2,
+    )
+    assert design.probabilities == pytest.approx({"high": 0.4, "low": 0.2})
+    assert design.expected_cost == pytest.approx(0.6)
+
+
+def test_bernoulli_allocator_handles_zero_and_mixed_risk_without_nan():
+    zero = compute_boundary_risk(
+        boundary_id="zero", W_b=[0.0], residual_vector=[0.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    all_zero = BernoulliRiskAllocator.allocate({"zero": zero}, budget=0.6, p_min=0.5)
+    assert all_zero.status == "feasible"
+    assert all_zero.lambda_value is None
+    assert all_zero.probabilities["zero"] == pytest.approx(0.5)
+    positive = compute_boundary_risk(
+        boundary_id="positive", W_b=[1.0], residual_vector=[0.0],
+        branch_covariance=[[1.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    mixed = BernoulliRiskAllocator.allocate(
+        {"zero": zero, "positive": positive}, budget=1.0, p_min=0.0,
+    )
+    assert mixed.status == "feasible"
+    assert mixed.probabilities["positive"] == pytest.approx(1.0)
+    assert mixed.probabilities["zero"] == pytest.approx(0.0)
+    assert AuditDesign.from_dict(mixed.to_dict()) == mixed
+
+
+def test_bernoulli_allocator_zero_risk_slack_budget_stops_at_floor():
+    zero = compute_boundary_risk(
+        boundary_id="zero-slack", W_b=[0.0], residual_vector=[0.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 2.0},
+    )
+    design = BernoulliRiskAllocator.allocate(
+        {"zero-slack": zero}, budget=100.0, p_min=0.25,
+    )
+    assert design.status == "feasible"
+    assert design.probabilities["zero-slack"] == pytest.approx(0.25)
+    assert design.expected_cost == pytest.approx(0.5)
+    assert design.lambda_value is None
+
+
+def test_bernoulli_allocator_positive_risk_saturation_leaves_zero_risk_at_floor():
+    zero = compute_boundary_risk(
+        boundary_id="zero-slack-mixed", W_b=[0.0], residual_vector=[0.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 2.0},
+    )
+    positive = compute_boundary_risk(
+        boundary_id="positive-slack-mixed", W_b=[1.0], residual_vector=[1.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    design = BernoulliRiskAllocator.allocate(
+        {"zero-slack-mixed": zero, "positive-slack-mixed": positive},
+        budget=100.0,
+        p_min=0.25,
+    )
+    assert design.probabilities["positive-slack-mixed"] == pytest.approx(1.0)
+    assert design.probabilities["zero-slack-mixed"] == pytest.approx(0.25)
+    assert design.expected_cost == pytest.approx(1.5)
+    assert design.lambda_value == pytest.approx(0.0)
+
+
+def test_bernoulli_allocator_persists_methods_lambda_not_scale():
+    risk = compute_boundary_risk(
+        boundary_id="lambda", W_b=[1.0], residual_vector=[1.0],
+        branch_covariance=[[0.0]], branch_counts=[1], cost_by_n={1: 1.0},
+    )
+    design = BernoulliRiskAllocator.allocate({"lambda": risk}, budget=0.25, p_min=0.0)
+    assert design.status == "feasible"
+    assert design.probabilities["lambda"] == pytest.approx(0.25)
+    assert design.lambda_value == pytest.approx(16.0)

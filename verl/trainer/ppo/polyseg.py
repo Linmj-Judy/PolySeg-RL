@@ -79,6 +79,8 @@ __all__ = [
     "load_polyseg_dependence_state_dict",
     "MLPSegmentCritic",
     "PolynomialTransitionEstimator",
+    "MacroLSVIPlan",
+    "MacroLSVIPlanner",
     "SegmentTrace",
     "SuffixFeedbackCollector",
     "enumerate_multi_indices",
@@ -3227,6 +3229,488 @@ class PolynomialTransitionEstimator:
         if beta < 0:
             raise ValueError("beta must be non-negative")
         return float(beta) * self.feature_norms(z)
+
+
+@dataclass
+class MacroLSVIPlan:
+    """Optimistic finite-action macro plan returned by ``MacroLSVIPlanner``.
+
+    Arrays are indexed as ``[stage, planning_state, action]``.  Keeping the
+    optimistic Q table and both confidence terms in the return object makes
+    exploration decisions auditable in a synthetic Macro-MDP experiment.
+    """
+
+    q_values: torch.Tensor
+    values: torch.Tensor
+    actions: torch.Tensor
+    reward_bonus: torch.Tensor
+    transition_bonus: torch.Tensor
+
+
+class MacroLSVIPlanner:
+    """Finite-action optimistic planner for the independent Macro-MDP branch.
+
+    ``fit`` consumes observed macro transitions with frozen state-action
+    features.  ``plan`` performs a stage-wise backward recursion over a
+    finite candidate action set.  Reward regression and direct ``P V``
+    regression use the same Legendre feature contract as
+    :class:`PolynomialTransitionEstimator`; uncertainty is added with
+    elliptical bonuses and the result is clipped to the duration-aware
+    ``r_max`` envelope.
+
+    The planner requires actual boundary successor features and candidate
+    action features.  It fails closed when those are absent, so a return
+    critic cannot be mistaken for an unknown-transition LSVI implementation.
+    It is an implementable finite-action Macro-MDP component, not a claim of a
+    general LLM or theorem-level regret guarantee.
+    """
+
+    VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        q: int,
+        feature_dim: int,
+        stages: int,
+        actions: int,
+        basis: str = "total",
+        normalized_basis: bool = False,
+        ridge_lambda: float = 1.0,
+        transition_ridge_lambda: float | None = None,
+        gamma: float = 1.0,
+        r_max: float = 1.0,
+        reward_confidence_beta: float = 1.0,
+        transition_confidence_beta: float = 1.0,
+    ) -> None:
+        if isinstance(q, bool) or int(q) != q or q < 0:
+            raise ValueError("q must be a non-negative integer")
+        if isinstance(feature_dim, bool) or int(feature_dim) != feature_dim or feature_dim < 1:
+            raise ValueError("feature_dim must be a positive integer")
+        if isinstance(stages, bool) or int(stages) != stages or stages < 1:
+            raise ValueError("stages must be a positive integer")
+        if isinstance(actions, bool) or int(actions) != actions or actions < 1:
+            raise ValueError("actions must be a positive integer")
+        if basis not in {"total", "additive"}:
+            raise ValueError("basis must be 'total' or 'additive'")
+        transition_lambda = ridge_lambda if transition_ridge_lambda is None else transition_ridge_lambda
+        for name, value in (
+            ("ridge_lambda", ridge_lambda),
+            ("transition_ridge_lambda", transition_lambda),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(float(gamma)) or not 0 < float(gamma) <= 1:
+            raise ValueError("gamma must lie in (0, 1]")
+        for name, value in (
+            ("r_max", r_max),
+            ("reward_confidence_beta", reward_confidence_beta),
+            ("transition_confidence_beta", transition_confidence_beta),
+        ):
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        self.q = int(q)
+        self.feature_dim = int(feature_dim)
+        self.stages = int(stages)
+        self.actions = int(actions)
+        self.basis = basis
+        self.normalized_basis = bool(normalized_basis)
+        self.ridge_lambda = float(ridge_lambda)
+        self.transition_ridge_lambda = float(transition_lambda)
+        self.gamma = float(gamma)
+        self.r_max = float(r_max)
+        self.reward_confidence_beta = float(reward_confidence_beta)
+        self.transition_confidence_beta = float(transition_confidence_beta)
+        self.dimension = int(
+            legendre_features(
+                torch.zeros(1, self.feature_dim),
+                self.q,
+                basis=self.basis,
+                normalized=self.normalized_basis,
+            ).shape[-1]
+        )
+        self.current_features: torch.Tensor | None = None
+        self.rewards: torch.Tensor | None = None
+        self.next_features: torch.Tensor | None = None
+        self.next_action_features: torch.Tensor | None = None
+        self.observation_mask: torch.Tensor | None = None
+        self.transition_mask: torch.Tensor | None = None
+        self.reward_theta: list[torch.Tensor | None] = [None] * self.stages
+        self.reward_gram: list[torch.Tensor | None] = [None] * self.stages
+        self.reward_counts: list[int] = [0] * self.stages
+        self.transition_models: list[PolynomialTransitionEstimator | None] = [None] * self.stages
+        self.last_plan: MacroLSVIPlan | None = None
+
+    def _design(self, features: torch.Tensor) -> torch.Tensor:
+        values = _as_tensor(features)
+        if values.shape[-1] != self.feature_dim:
+            raise ValueError("features do not match planner feature_dim")
+        return legendre_features(
+            values.reshape(-1, self.feature_dim),
+            self.q,
+            basis=self.basis,
+            normalized=self.normalized_basis,
+            strict_range=True,
+        ).reshape(*values.shape[:-1], self.dimension)
+
+    def _fit_reward_models(self) -> None:
+        assert self.current_features is not None
+        assert self.rewards is not None and self.observation_mask is not None
+        design = self._design(self.current_features)
+        self.reward_theta = [None] * self.stages
+        self.reward_gram = [None] * self.stages
+        self.reward_counts = [0] * self.stages
+        for stage in range(self.stages):
+            valid = self.observation_mask[:, stage]
+            if not bool(valid.any()):
+                continue
+            x = design[valid, stage]
+            y = self.rewards[valid, stage].to(dtype=x.dtype)
+            gram = x.T @ x
+            eye = torch.eye(self.dimension, dtype=x.dtype, device=x.device)
+            self.reward_theta[stage] = torch.linalg.solve(gram + self.ridge_lambda * eye, x.T @ y)
+            self.reward_gram[stage] = gram
+            self.reward_counts[stage] = int(valid.sum().item())
+
+    def fit(
+        self,
+        current_features: torch.Tensor,
+        rewards: torch.Tensor,
+        next_features: torch.Tensor,
+        next_action_features: torch.Tensor,
+        *,
+        observation_mask: torch.Tensor | None = None,
+        transition_mask: torch.Tensor | None = None,
+    ) -> "MacroLSVIPlanner":
+        """Fit the planner on observed macro rows.
+
+        Shapes are ``[N, stages, feature_dim]`` for current and successor
+        state-action features, ``[N, stages]`` for cumulative rewards, and
+        ``[N, stages, actions, feature_dim]`` for candidate actions at each
+        observed successor boundary.  The current feature is the frozen
+        state-action representation used by the reward and transition model;
+        callers must keep this representation fixed across planner updates.
+        """
+
+        current = _as_tensor(current_features)
+        reward = _as_tensor(rewards, device=current.device)
+        successor = _as_tensor(next_features, device=current.device)
+        next_candidates = _as_tensor(next_action_features, device=current.device)
+        expected = (current.shape[0], self.stages, self.feature_dim)
+        if current.ndim != 3 or tuple(current.shape) != expected:
+            raise ValueError("current_features must have shape [N, stages, feature_dim]")
+        if reward.shape != current.shape[:2]:
+            raise ValueError("rewards must have shape [N, stages]")
+        if successor.shape != current.shape:
+            raise ValueError("next_features must match current_features")
+        if next_candidates.shape != (current.shape[0], self.stages, self.actions, self.feature_dim):
+            raise ValueError("next_action_features must have shape [N, stages, actions, feature_dim]")
+        for name, value in (
+            ("current_features", current),
+            ("rewards", reward),
+            ("next_features", successor),
+            ("next_action_features", next_candidates),
+        ):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} must contain finite values")
+        # Validate the frozen feature range before any state is mutated.
+        self._design(current.reshape(-1, self.feature_dim))
+        self._design(successor.reshape(-1, self.feature_dim))
+        self._design(next_candidates.reshape(-1, self.feature_dim))
+        observed = torch.ones(current.shape[:2], dtype=torch.bool, device=current.device)
+        if observation_mask is not None:
+            observed = _as_tensor(observation_mask, device=current.device).to(torch.bool)
+            if observed.shape != current.shape[:2]:
+                raise ValueError("observation_mask must have shape [N, stages]")
+        transitions = observed.clone()
+        if transition_mask is not None:
+            transitions = _as_tensor(transition_mask, device=current.device).to(torch.bool)
+            if transitions.shape != current.shape[:2]:
+                raise ValueError("transition_mask must have shape [N, stages]")
+            transitions = transitions & observed
+        self.current_features = current.detach().clone()
+        self.rewards = reward.detach().clone()
+        self.next_features = successor.detach().clone()
+        self.next_action_features = next_candidates.detach().clone()
+        self.observation_mask = observed.detach().clone()
+        self.transition_mask = transitions.detach().clone()
+        self.transition_models = [None] * self.stages
+        self._fit_reward_models()
+        self.last_plan = None
+        return self
+
+    def update(
+        self,
+        current_features: torch.Tensor,
+        rewards: torch.Tensor,
+        next_features: torch.Tensor,
+        next_action_features: torch.Tensor,
+        *,
+        observation_mask: torch.Tensor | None = None,
+        transition_mask: torch.Tensor | None = None,
+    ) -> "MacroLSVIPlanner":
+        """Append one batch of macro rows and refit sufficient statistics."""
+
+        if self.current_features is None:
+            return self.fit(
+                current_features,
+                rewards,
+                next_features,
+                next_action_features,
+                observation_mask=observation_mask,
+                transition_mask=transition_mask,
+            )
+        current, rewards, successor, next_candidates = (
+            current_features,
+            rewards,
+            next_features,
+            next_action_features,
+        )
+        current = _as_tensor(current, device=self.current_features.device)
+        rewards = _as_tensor(rewards, device=self.current_features.device)
+        successor = _as_tensor(successor, device=self.current_features.device)
+        next_candidates = _as_tensor(next_candidates, device=self.current_features.device)
+        old_observed = self.observation_mask
+        old_transitions = self.transition_mask
+        assert old_observed is not None and old_transitions is not None
+        new_observed = torch.ones(rewards.shape, dtype=torch.bool, device=current.device)
+        if observation_mask is not None:
+            new_observed = _as_tensor(observation_mask, device=current.device).to(torch.bool)
+        new_transitions = new_observed.clone()
+        if transition_mask is not None:
+            new_transitions = _as_tensor(transition_mask, device=current.device).to(torch.bool) & new_observed
+        return self.fit(
+            torch.cat((self.current_features, current), dim=0),
+            torch.cat((self.rewards, rewards), dim=0),
+            torch.cat((self.next_features, successor), dim=0),
+            torch.cat((self.next_action_features, next_candidates), dim=0),
+            observation_mask=torch.cat((old_observed, new_observed), dim=0),
+            transition_mask=torch.cat((old_transitions, new_transitions), dim=0),
+        )
+
+    def _predict_reward(self, stage: int, candidates: torch.Tensor) -> torch.Tensor:
+        design = self._design(candidates)
+        theta = self.reward_theta[stage]
+        if theta is None:
+            return torch.zeros(candidates.shape[:-1], dtype=candidates.dtype, device=candidates.device)
+        return design @ theta.to(device=design.device, dtype=design.dtype)
+
+    def _evaluate_stage(
+        self,
+        stage: int,
+        candidates: torch.Tensor,
+        stage_models: Sequence[PolynomialTransitionEstimator | None],
+        durations: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return optimistic Q, reward bonus, and transition bonus."""
+
+        if candidates.ndim < 2 or candidates.shape[-1] != self.feature_dim:
+            raise ValueError("candidate features must end in feature_dim")
+        flat = candidates.reshape(-1, self.feature_dim)
+        reward = self._predict_reward(stage, flat).reshape(candidates.shape[:-1])
+        transition = stage_models[stage]
+        future_bound = durations[stage + 1 :].sum() * self.r_max
+        if transition is None:
+            successor = torch.full_like(reward, future_bound)
+            transition_bonus = torch.zeros_like(reward)
+        else:
+            successor = transition.predict_test_function(flat).reshape_as(reward)
+            transition_bonus = transition_confidence_bonus(
+                transition.features(flat),
+                gram=transition.gram_matrix(),
+                beta=self.transition_confidence_beta,
+            ).reshape_as(reward)
+            transition_bonus = transition_bonus * future_bound.to(transition_bonus)
+        reward_bonus = torch.zeros_like(reward)
+        if self.reward_theta[stage] is not None and self.reward_gram[stage] is not None:
+            gram = self.reward_gram[stage].to(device=flat.device, dtype=flat.dtype)
+            gram = gram + self.ridge_lambda * torch.eye(self.dimension, dtype=flat.dtype, device=flat.device)
+            reward_bonus = confidence_bonus(
+                self._design(flat),
+                gram=gram,
+                beta=self.reward_confidence_beta,
+            ).reshape_as(reward)
+        discount = torch.pow(
+            torch.as_tensor(self.gamma, dtype=reward.dtype, device=reward.device), durations[stage]
+        )
+        q_values = reward + discount * successor + reward_bonus + transition_bonus
+        upper = durations[stage:].sum() * self.r_max
+        if self.reward_theta[stage] is None:
+            q_values = torch.full_like(q_values, upper)
+        q_values = q_values.clamp_min(0).minimum(upper.to(q_values))
+        return q_values.masked_fill(~action_mask, -torch.inf), reward_bonus, transition_bonus
+
+    def plan(
+        self,
+        candidate_features: torch.Tensor,
+        *,
+        action_mask: torch.Tensor | None = None,
+        durations: torch.Tensor | None = None,
+    ) -> MacroLSVIPlan:
+        """Run optimistic backward recursion over candidate macro actions.
+
+        ``candidate_features`` may be ``[stages, actions, feature_dim]`` for
+        one planning state or ``[stages, states, actions, feature_dim]`` for
+        a batch of planning states.
+        """
+
+        if self.current_features is None or self.observation_mask is None or self.transition_mask is None:
+            raise RuntimeError("fit must be called before plan")
+        candidates = _as_tensor(candidate_features)
+        if candidates.ndim == 3:
+            candidates = candidates.unsqueeze(1)
+        if candidates.ndim != 4 or candidates.shape[0] != self.stages or candidates.shape[2:] != (
+            self.actions,
+            self.feature_dim,
+        ):
+            raise ValueError("candidate_features must have shape [stages, states, actions, feature_dim]")
+        self._design(candidates.reshape(-1, self.feature_dim))
+        states = int(candidates.shape[1])
+        if action_mask is None:
+            valid_actions = torch.ones(
+                (self.stages, states, self.actions), dtype=torch.bool, device=candidates.device
+            )
+        else:
+            valid_actions = _as_tensor(action_mask, device=candidates.device).to(torch.bool)
+            if valid_actions.ndim == 2:
+                valid_actions = valid_actions.unsqueeze(1).expand(-1, states, -1)
+            if valid_actions.shape != (self.stages, states, self.actions):
+                raise ValueError("action_mask must have shape [stages, states, actions]")
+        if not bool(valid_actions.any(dim=-1).all()):
+            raise ValueError("each planning state must have at least one valid action")
+        if durations is None:
+            duration_values = torch.ones(self.stages, dtype=candidates.dtype, device=candidates.device)
+        else:
+            duration_values = _as_tensor(durations, device=candidates.device).flatten()
+            if duration_values.shape != (self.stages,):
+                raise ValueError("durations must have shape [stages]")
+            if torch.any(~torch.isfinite(duration_values)) or torch.any(duration_values <= 0):
+                raise ValueError("durations must be finite and positive")
+        q_values = torch.zeros(
+            (self.stages, states, self.actions), dtype=candidates.dtype, device=candidates.device
+        )
+        values = torch.zeros((self.stages, states), dtype=candidates.dtype, device=candidates.device)
+        actions = torch.zeros((self.stages, states), dtype=torch.long, device=candidates.device)
+        reward_bonuses = torch.zeros_like(q_values)
+        transition_bonuses = torch.zeros_like(q_values)
+        stage_models: list[PolynomialTransitionEstimator | None] = [None] * self.stages
+        assert self.current_features is not None and self.next_features is not None
+        assert self.next_action_features is not None and self.transition_mask is not None
+        for stage in reversed(range(self.stages)):
+            if stage < self.stages - 1:
+                transition_rows = self.transition_mask[:, stage]
+                if bool(transition_rows.any()):
+                    next_candidates = self.next_action_features[transition_rows, stage + 1]
+                    next_mask = torch.ones(
+                        (next_candidates.shape[0], self.actions), dtype=torch.bool, device=next_candidates.device
+                    )
+                    next_q, _, _ = self._evaluate_stage(
+                        stage + 1,
+                        next_candidates,
+                        stage_models,
+                        duration_values,
+                        next_mask,
+                    )
+                    next_values = next_q.max(dim=-1).values
+                    transition = PolynomialTransitionEstimator(
+                        self.q,
+                        self.feature_dim,
+                        basis=self.basis,
+                        ridge_lambda=self.transition_ridge_lambda,
+                    )
+                    targets = next_values.detach()
+                    transition.fit_test_function(
+                        self.current_features[transition_rows, stage],
+                        self.next_features[transition_rows, stage],
+                        lambda successor, targets=targets: targets.to(
+                            device=successor.device, dtype=successor.dtype
+                        ),
+                    )
+                    stage_models[stage] = transition
+            q_stage, reward_bonus, transition_bonus = self._evaluate_stage(
+                stage,
+                candidates[stage],
+                stage_models,
+                duration_values,
+                valid_actions[stage],
+            )
+            q_values[stage] = q_stage
+            reward_bonuses[stage] = reward_bonus
+            transition_bonuses[stage] = transition_bonus
+            actions[stage] = torch.argmax(q_stage, dim=-1)
+            values[stage] = q_stage.gather(-1, actions[stage].unsqueeze(-1)).squeeze(-1)
+        self.transition_models = stage_models
+        plan = MacroLSVIPlan(
+            q_values=q_values,
+            values=values,
+            actions=actions,
+            reward_bonus=reward_bonuses,
+            transition_bonus=transition_bonuses,
+        )
+        self.last_plan = plan
+        return plan
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.VERSION,
+            "q": self.q,
+            "feature_dim": self.feature_dim,
+            "stages": self.stages,
+            "actions": self.actions,
+            "basis": self.basis,
+            "normalized_basis": self.normalized_basis,
+            "ridge_lambda": self.ridge_lambda,
+            "transition_ridge_lambda": self.transition_ridge_lambda,
+            "gamma": self.gamma,
+            "r_max": self.r_max,
+            "reward_confidence_beta": self.reward_confidence_beta,
+            "transition_confidence_beta": self.transition_confidence_beta,
+            "current_features": None if self.current_features is None else self.current_features.detach().cpu(),
+            "rewards": None if self.rewards is None else self.rewards.detach().cpu(),
+            "next_features": None if self.next_features is None else self.next_features.detach().cpu(),
+            "next_action_features": None
+            if self.next_action_features is None
+            else self.next_action_features.detach().cpu(),
+            "observation_mask": None if self.observation_mask is None else self.observation_mask.cpu(),
+            "transition_mask": None if self.transition_mask is None else self.transition_mask.cpu(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "MacroLSVIPlanner":
+        if not isinstance(state, Mapping):
+            raise ValueError("planner checkpoint must be a mapping")
+        if int(state.get("version", cls.VERSION)) != cls.VERSION:
+            raise ValueError("unsupported MacroLSVIPlanner checkpoint version")
+        planner = cls(
+            q=int(state["q"]),
+            feature_dim=int(state["feature_dim"]),
+            stages=int(state["stages"]),
+            actions=int(state["actions"]),
+            basis=state.get("basis", "total"),
+            normalized_basis=bool(state.get("normalized_basis", False)),
+            ridge_lambda=float(state.get("ridge_lambda", 1.0)),
+            transition_ridge_lambda=float(
+                state.get("transition_ridge_lambda", state.get("ridge_lambda", 1.0))
+            ),
+            gamma=float(state.get("gamma", 1.0)),
+            r_max=float(state.get("r_max", 1.0)),
+            reward_confidence_beta=float(state.get("reward_confidence_beta", 1.0)),
+            transition_confidence_beta=float(state.get("transition_confidence_beta", 1.0)),
+        )
+        if state.get("current_features") is not None:
+            required = ("rewards", "next_features", "next_action_features")
+            if any(state.get(key) is None for key in required):
+                raise ValueError("planner checkpoint is missing fitted data")
+            planner.fit(
+                state["current_features"],
+                state["rewards"],
+                state["next_features"],
+                state["next_action_features"],
+                observation_mask=state.get("observation_mask"),
+                transition_mask=state.get("transition_mask"),
+            )
+        return planner
 
 
 class SuffixFeedbackCollector:

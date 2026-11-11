@@ -1,19 +1,30 @@
 import asyncio
+import json
+import sys
+import types
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+from types import SimpleNamespace
 
 import verl.trainer.ppo.polyseg_openai4s_provider as openai4s_provider
 from verl.trainer.config.algorithm import PolySegScienceConfig
+from verl.trainer.ppo.polyseg_sci import FidelityFeatureMapContract
 from verl.trainer.ppo.polyseg_sci_provider import (
     CallbackScienceRoundProvider,
     ScienceRoundRequest,
     ScienceRoundResponse,
     attach_science_response,
+    attach_science_response_to_batch,
     load_science_round_provider,
+    materialize_science_batch_fields,
     science_enabled,
 )
+from verl.protocol import DataProto
+from tensordict import TensorDict
+from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 
 
 def _fields():
@@ -183,10 +194,380 @@ def test_openai4s_provider_executes_existing_round_and_adapter(monkeypatch):
         },
     )
     response = asyncio.run(openai4s_provider.OpenAI4SScienceRoundProvider().execute(request))
-    assert called == {"marker": "real-harness-contract", "boundary_ids": ("b0",)}
+    assert called == {
+        "marker": "real-harness-contract",
+        "boundary_ids": ("b0",),
+        "round_id": "round-1",
+    }
     assert response.audit["provider"] == "openai4s"
     assert response.audit["verification"]["passed"] is True
     assert response.research_eligible is False
+
+
+def test_openai4s_provider_applies_configured_query_contract_defaults(monkeypatch):
+    class Verification:
+        passed = True
+        reasons = ()
+        checked_fields = ("query_propensity",)
+
+    class Result:
+        corrected_boundary_values = torch.tensor([[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]])
+        segment_gradient = torch.tensor([[0.1], [0.2]])
+        verification = Verification()
+        ledger = {"spent": 3.0}
+        audit = {"source": "openai4s"}
+        boundary_records = ()
+        covariance_by_boundary = {}
+
+    called = {}
+
+    def fake_round(**kwargs):
+        called.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(openai4s_provider, "run_science_round", fake_round)
+
+    class Schema:
+        dimension = 2
+        fingerprint = ""
+
+    class Adapter:
+        schema = Schema()
+
+        def science_rollout_fields(self, **_):
+            return _fields()
+
+    config = OmegaConf.create(
+        {
+            "algorithm": {
+                "polyseg": {
+                    "science": {
+                        "query_mode": "adaptive",
+                        "budget_mode": "hard",
+                        "hard_budget": False,
+                        "min_inclusion_probability": 0.2,
+                        "branch_count": 3,
+                    }
+                }
+            }
+        }
+    )
+    request = ScienceRoundRequest(
+        output=None,
+        outputs=(),
+        validate=False,
+        context={
+            "openai4s_science_round": {
+                "adapter": Adapter(),
+                "action_mask": [True, True, True],
+                "boundaries": ["b0", "b1"],
+                "round_kwargs": {"marker": "configured-contract", "boundary_ids": ("b0",)},
+                "round_id": "round-configured",
+                "research_eligible": False,
+            }
+        },
+    )
+    asyncio.run(openai4s_provider.OpenAI4SScienceRoundProvider(config).execute(request))
+    assert called["query_mode"] == "adaptive"
+    assert called["hard_budget"] is True
+    assert called["min_inclusion_probability"] == pytest.approx(0.2)
+    assert called["branch_count"] == 3
+
+
+def test_openai4s_provider_round_factory_materializes_harness_spec(monkeypatch):
+    class Verification:
+        passed = True
+        reasons = ()
+        checked_fields = ()
+
+    class Result:
+        corrected_boundary_values = torch.tensor([[0.0], [1.0]])
+        segment_gradient = torch.tensor([[0.1]])
+        verification = Verification()
+        ledger = {"budget": 4.0, "spent": 1.0}
+        audit = {"correction": {"unbiased_under_response_model": True}}
+        boundary_records = ()
+        covariance_by_boundary = {}
+
+    called = {}
+
+    def fake_round(**kwargs):
+        called.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(openai4s_provider, "run_science_round", fake_round)
+    module = types.ModuleType("test_polyseg_round_factory")
+
+    class Factory:
+        def __call__(self, request):
+            assert request.context["row_index"] == 3
+            class Adapter:
+                schema = type("Schema", (), {"dimension": 1, "fingerprint": ""})()
+
+                def science_rollout_fields(self, **_):
+                    return {
+                        "segment_ids": torch.tensor([0]),
+                        "segment_mask": torch.tensor([True]),
+                        "science_boundary_values": torch.tensor([[0.0], [1.0]]),
+                        "science_boundary_mask": torch.tensor([True]),
+                        "science_endpoint_mask": torch.ones(2, 1, dtype=torch.bool),
+                    }
+            return {
+                "adapter": Adapter(),
+                "action_mask": (True,),
+                "boundaries": ("b0",),
+                "round_kwargs": {"boundary_ids": ()},
+                "round_id": "factory-round-3",
+                "research_eligible": False,
+            }
+
+    def factory(_config):
+        return Factory()
+
+    module.factory = factory
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    config = OmegaConf.create(
+        {
+            "algorithm": {
+                "polyseg": {
+                    "science": {
+                        "round_factory_path": "test_polyseg_round_factory:factory",
+                    }
+                }
+            }
+        }
+    )
+    provider = openai4s_provider.OpenAI4SScienceRoundProvider(config)
+    request = ScienceRoundRequest(
+        output=None,
+        outputs=(),
+        validate=False,
+        context={"row_index": 3},
+    )
+    response = asyncio.run(provider.execute(request))
+    assert called["round_id"] == "factory-round-3"
+    assert response.research_eligible is False
+
+
+def test_driver_batch_attachment_materializes_ragged_science_axes():
+    rows = np.empty(2, dtype=object)
+    rows[:] = [{}, {}]
+    batch = DataProto(
+        batch=TensorDict(
+            {"responses": torch.zeros(2, 3, dtype=torch.long)},
+            batch_size=[2],
+        ),
+        non_tensor_batch={"extra_fields": rows},
+    )
+    response0 = ScienceRoundResponse(
+        fields={
+            "segment_ids": torch.tensor([0, 0, -1]),
+            "segment_mask": torch.tensor([True]),
+            "science_boundary_values": torch.tensor([[0.0], [1.0]]),
+            "science_boundary_mask": torch.tensor([True]),
+            "science_endpoint_mask": torch.ones(2, 1, dtype=torch.bool),
+        }
+    )
+    response1 = ScienceRoundResponse(
+        fields={
+            "segment_ids": torch.tensor([0, 1, 1]),
+            "segment_mask": torch.tensor([True, True]),
+            "science_boundary_values": torch.tensor([[0.0], [0.5], [1.0]]),
+            "science_boundary_mask": torch.tensor([True, True]),
+            "science_endpoint_mask": torch.ones(3, 1, dtype=torch.bool),
+        }
+    )
+    attach_science_response_to_batch(batch, 0, response0)
+    attach_science_response_to_batch(batch, 1, response1)
+    materialize_science_batch_fields(batch)
+    assert tuple(batch.batch["science_boundary_values"].shape) == (2, 3, 1)
+    assert tuple(batch.batch["science_boundary_mask"].shape) == (2, 2)
+    assert tuple(batch.batch["segment_ids"].shape) == (2, 3)
+    assert batch.batch["science_boundary_mask"][0].tolist() == [True, False]
+
+
+def test_driver_owned_manager_runs_provider_after_worker_aggregation():
+    rows = np.empty(2, dtype=object)
+    rows[:] = [{"trajectory_id": "t0"}, {"trajectory_id": "t1"}]
+    batch = DataProto(
+        batch=TensorDict(
+            {"responses": torch.zeros(2, 2, dtype=torch.long)},
+            batch_size=[2],
+        ),
+        non_tensor_batch={"extra_fields": rows},
+    )
+
+    class Provider:
+        def __init__(self):
+            self.seen = []
+
+        async def execute(self, request):
+            self.seen.append(request.context["row_index"])
+            return ScienceRoundResponse(
+                fields={
+                    "segment_ids": torch.tensor([0, 0]),
+                    "segment_mask": torch.tensor([True]),
+                    "science_boundary_values": torch.tensor([[0.0], [float(request.context["row_index"] + 1)]]),
+                    "science_boundary_mask": torch.tensor([True]),
+                    "science_endpoint_mask": torch.ones(2, 1, dtype=torch.bool),
+                },
+                audit={"correction": {"unbiased_under_response_model": True}},
+            )
+
+    manager = object.__new__(AgentLoopManager)
+    manager.science_round_provider = Provider()
+    manager.science_execution_owner = "driver"
+    manager.science_runtime = SimpleNamespace(
+        fitted=True,
+        checkpoint_state=lambda: SimpleNamespace(fingerprint="runtime-test"),
+    )
+    asyncio.run(manager._apply_driver_science_rounds(batch, prompts=batch))
+    assert manager.science_round_provider.seen == [0, 1]
+    assert batch.batch["science_boundary_values"].shape == (2, 2, 1)
+    assert torch.equal(batch.batch["segment_ids"], torch.tensor([[0, 0], [0, 0]]))
+
+
+def test_openai4s_provider_checks_configured_fidelity_feature_map(tmp_path, monkeypatch):
+    class Verification:
+        passed = True
+        reasons = ()
+        checked_fields = ("ledger",)
+
+    class Result:
+        corrected_boundary_values = torch.tensor([[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]])
+        segment_gradient = torch.tensor([[0.1], [0.2]])
+        verification = Verification()
+        ledger = {"spent": 3.0}
+        audit = {"source": "openai4s"}
+        boundary_records = ()
+        covariance_by_boundary = {}
+
+    monkeypatch.setattr(openai4s_provider, "run_science_round", lambda **_: Result())
+    fidelity_map = FidelityFeatureMapContract.fit(
+        [[0.1, 2.0], [0.8, 4.0]],
+        [[True, True], [True, True]],
+        ("a::a-lf", "b::b-lf"),
+    )
+    path = tmp_path / "fidelity.json"
+    path.write_text(json.dumps(fidelity_map.to_dict()), encoding="utf-8")
+
+    class Schema:
+        dimension = 2
+        fingerprint = ""
+
+    class Adapter:
+        schema = Schema()
+        fidelity_feature_map = fidelity_map
+
+        def science_rollout_fields(self, **_kwargs):
+            return _fields()
+
+    spec = {
+        "adapter": Adapter(),
+        "action_mask": [True, True, True],
+        "boundaries": ["b0", "b1"],
+        "round_kwargs": {"boundary_ids": ("b0",)},
+        "research_eligible": False,
+    }
+    config = {
+        "algorithm": {
+            "polyseg": {
+                "science": {
+                    "fidelity_feature_map_path": str(path),
+                    "fidelity_feature_map_hash": fidelity_map.fingerprint,
+                }
+            }
+        }
+    }
+    response = asyncio.run(
+        openai4s_provider.OpenAI4SScienceRoundProvider(config).execute(
+            ScienceRoundRequest(output=None, outputs=(), validate=False, context={"openai4s_science_round": spec})
+        )
+    )
+    assert response.audit["provider"] == "openai4s"
+
+    bad_config = {
+        "algorithm": {
+            "polyseg": {
+                "science": {
+                    "fidelity_feature_map_path": str(path),
+                    "fidelity_feature_map_hash": "0" * 64,
+                }
+            }
+        }
+    }
+    with pytest.raises(openai4s_provider.OpenAI4SProviderError, match="fidelity_feature_map_hash"):
+        asyncio.run(
+            openai4s_provider.OpenAI4SScienceRoundProvider(bad_config).execute(
+                ScienceRoundRequest(output=None, outputs=(), validate=False, context={"openai4s_science_round": spec})
+            )
+        )
+
+
+def test_openai4s_provider_propagates_final_ineligibility_to_prior_records(monkeypatch):
+    class Verification:
+        passed = True
+        reasons = ()
+        checked_fields = ("ledger",)
+
+    class Result:
+        corrected_boundary_values = torch.tensor([[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]])
+        segment_gradient = torch.tensor([[0.1], [0.2]])
+        verification = Verification()
+        ledger = {"spent": 3.0}
+        audit = {
+            "restore_evidence_kinds": {"b0": "durable"},
+            "continuation_research_eligible": {"b0": True},
+            "correction": {"unbiased_under_response_model": False},
+        }
+        boundary_records = ()
+        covariance_by_boundary = {}
+
+    monkeypatch.setattr(openai4s_provider, "run_science_round", lambda **_: Result())
+
+    class Schema:
+        dimension = 2
+        fingerprint = ""
+
+    class Adapter:
+        schema = Schema()
+
+        def science_rollout_fields(self, **_kwargs):
+            return _fields()
+
+    prior = {
+        "trajectory_id": "prior-traj",
+        "task_id": "prior-task",
+        "split": "train",
+        "science_research_eligible": True,
+        "boundary_features": [[0.0]],
+        "terminal_endpoint_observations": [],
+    }
+    response = asyncio.run(
+        openai4s_provider.OpenAI4SScienceRoundProvider().execute(
+            ScienceRoundRequest(
+                output=None,
+                outputs=(),
+                validate=False,
+                context={
+                    "openai4s_science_round": {
+                        "adapter": Adapter(),
+                        "action_mask": (True, True, True),
+                        "boundaries": ("b0", "b1"),
+                        "round_kwargs": {"boundary_ids": ("b0",)},
+                        "research_eligible": True,
+                        "trajectory_complete": True,
+                        "restore_evidence_kind": "durable",
+                        "continuation_mode": "restored_boundary",
+                        "prior_rollout_records": [prior],
+                    }
+                },
+            )
+        )
+    )
+    assert response.research_eligible is False
+    assert response.audit["research_eligibility_rejection"] == "response_model_not_validated"
+    assert response.fields["science_prior_rollouts"][0]["science_research_eligible"] is False
 
 
 class _ProviderSchema:

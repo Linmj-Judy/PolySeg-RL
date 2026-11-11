@@ -49,7 +49,7 @@ def _strict_real(value: Any, name: str, *, minimum: float = 0.0, strictly_positi
 
 @dataclass
 class PolySegScienceConfig(BaseConfig):
-    """PolySeg-Sci v4 configuration.
+    """PolySeg-Sci v5 configuration.
 
     The scalar ``algorithm.polyseg`` fields remain the compatibility path for
     existing experiments.  Setting ``enabled`` activates the vector,
@@ -64,17 +64,48 @@ class PolySegScienceConfig(BaseConfig):
     endpoint_schema_hash: str = ""
     feature_map_path: str = ""
     feature_map_hash: str = ""
+    fidelity_feature_map_path: str = ""
+    fidelity_feature_map_hash: str = ""
     provider_path: str = ""
+    # Where the mutable science round lifecycle executes.  ``worker`` keeps
+    # the historical callback path; ``driver`` runs the provider after Ray
+    # worker outputs are aggregated so the driver-owned runtime is the single
+    # source of predictor/sampler/ledger state.
+    execution_owner: str = "worker"
+    # Optional harness factory used when a rollout does not embed an explicit
+    # ``openai4s_science_round`` spec.  The factory receives a
+    # ``ScienceRoundRequest`` and must return the same mapping contract.
+    round_factory_path: str = ""
     segment_rule: str = "fixed_action_tokens"
     segment_rule_version: str = "polyseg-sci-causal-boundary-v1"
+    max_segments: int = 8
+    min_action_tokens: int = 8
+    max_action_tokens: int = 512
+    require_causal_boundary: bool = True
+    representation_source: str = "frozen_hidden_projection"
+    projection_dim: int = 8
+    normalize_to_unit_interval: bool = True
+    freeze_before_rl: bool = True
+    cross_fit_by: str = "trajectory"
+    fit_on_prior_batches: bool = True
+    stop_gradient: bool = True
     query_mode: str = "uniform"
     hard_budget: bool = False
+    budget_mode: str = "expected"
+    min_inclusion_probability: float = 0.0
+    record_joint_inclusion_probability: bool = True
+    response_model: str = "audited"
     train_budget: float | None = None
+    ledger_path: str = ""
     predictor_q: int = 2
     predictor_basis: str = "total"
     predictor_ridge_lambda: float = 1.0
     branch_count: int = 1
     require_restore_audit: bool = True
+    require_full_state_contract: bool = True
+    require_independent_rng: bool = True
+    inherit_remaining_execution_budget: bool = True
+    fail_closed: bool = True
     policy_update: str = "preference"
     normalize_advantages: bool = False
     endpoint_weights: tuple[float, ...] | None = None
@@ -84,17 +115,46 @@ class PolySegScienceConfig(BaseConfig):
     allow_dual_bootstrap: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("enabled", "hard_budget", "require_restore_audit", "normalize_advantages", "allow_dual_bootstrap"):
+        for name in ("enabled", "hard_budget", "require_restore_audit", "require_causal_boundary", "normalize_to_unit_interval", "freeze_before_rl", "fit_on_prior_batches", "stop_gradient", "record_joint_inclusion_probability", "require_full_state_contract", "require_independent_rng", "inherit_remaining_execution_budget", "fail_closed", "normalize_advantages", "allow_dual_bootstrap"):
             _strict_bool(getattr(self, name), f"science {name}")
         if self.objective_mode not in {"pareto", "preference", "constraint"}:
             raise ValueError("polyseg science objective_mode is invalid")
         if self.query_mode not in {"uniform", "adaptive"}:
             raise ValueError("polyseg science query_mode is invalid")
+        if self.budget_mode not in {"hard", "expected"}:
+            raise ValueError("polyseg science budget_mode is invalid")
+        if self.response_model not in {"audited", "none"}:
+            raise ValueError("polyseg science response_model is invalid")
+        if self.execution_owner not in {"worker", "driver"}:
+            raise ValueError("polyseg science execution_owner must be worker or driver")
+        if not isinstance(self.round_factory_path, str):
+            raise ValueError("polyseg science round_factory_path must be a string")
+        if self.cross_fit_by not in {"trajectory", "task", "none"}:
+            raise ValueError("polyseg science cross_fit_by is invalid")
+        if self.representation_source not in {"frozen_hidden_projection", "rollout_features", "registered"}:
+            raise ValueError("polyseg science representation_source is invalid")
+        _strict_int(self.max_segments, "science max_segments", minimum=1)
+        _strict_int(self.min_action_tokens, "science min_action_tokens", minimum=1)
+        _strict_int(self.max_action_tokens, "science max_action_tokens", minimum=1)
+        if self.max_action_tokens < self.min_action_tokens:
+            raise ValueError("science max_action_tokens must be >= min_action_tokens")
+        _strict_int(self.projection_dim, "science projection_dim", minimum=1)
         _strict_int(self.predictor_q, "science predictor_q", minimum=0)
         _strict_int(self.branch_count, "science branch_count", minimum=1)
         _strict_real(self.predictor_ridge_lambda, "science predictor_ridge_lambda", strictly_positive=True)
+        _strict_real(self.min_inclusion_probability, "science min_inclusion_probability")
+        if not 0 <= float(self.min_inclusion_probability) <= 1:
+            raise ValueError("science min_inclusion_probability must be in [0,1]")
         if self.train_budget is not None:
             _strict_real(self.train_budget, "science train_budget")
+        if not isinstance(self.ledger_path, str):
+            raise ValueError("science ledger_path must be a string")
+        if not isinstance(self.fidelity_feature_map_path, str) or not isinstance(self.fidelity_feature_map_hash, str):
+            raise ValueError("science fidelity feature-map paths and hashes must be strings")
+        if self.fidelity_feature_map_hash and not self.fidelity_feature_map_path:
+            raise ValueError(
+                "science fidelity_feature_map_hash requires fidelity_feature_map_path"
+            )
         if self.policy_update not in {"pareto", "preference", "constraint"}:
             raise ValueError("polyseg science policy_update is invalid")
         if self.objective_mode != "preference" and self.policy_update not in {"preference", self.objective_mode}:

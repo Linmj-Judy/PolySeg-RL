@@ -266,6 +266,11 @@ class AgentLoopManagerTQ(AgentLoopManager):
     def __init__(self, *args, **kwargs):
         self.agent_loop_workers_class = AgentLoopWorkerTQ
         super().__init__(*args, **kwargs)
+        if self.science_execution_owner == "driver":
+            raise ValueError(
+                "driver-owned PolySeg-Sci execution requires the ordinary AgentLoop manager; "
+                "TransferQueue output persistence has no driver materialization phase"
+            )
 
     @classmethod
     @auto_await

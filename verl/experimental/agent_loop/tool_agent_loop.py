@@ -16,6 +16,8 @@ import inspect
 import json
 import logging
 import os
+from collections.abc import Mapping
+from copy import deepcopy
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -162,6 +164,11 @@ class AgentData:
         self.segment_tool_observations: dict[int, list[str]] = {}
         self.segment_tool_observation_spans: dict[int, list[dict[str, Any]]] = {}
         self.segment_tool_calls: dict[int, list[dict[str, Any]]] = {}
+        # Provider-owned runtime artifacts may be returned by a stateful tool
+        # harness (or exported by the boundary provider) at a tool boundary.
+        # Keep them separate from token/event metadata: IDs and observations
+        # cannot stand in for recoverable model/kernel state.
+        self.segment_runtime_artifacts: dict[int, dict[str, Any]] = {}
         self.segment_action_texts: dict[int, str] = {}
         self.segment_durations: dict[int, float] = {}
         self.turn_scores: list[float] = []
@@ -576,21 +583,51 @@ class ToolAgentLoop(AgentLoopBase):
             "trajectory_id": agent_data.request_id,
             "session_id": agent_data.request_id,
             "segment_id": segment_id,
+            # ``prompt_ids`` is the full merged context while response_mask is
+            # response-aligned. Pad the latter over the prompt prefix so the
+            # durable contract can verify one token-aligned action vector.
             "prefix_token_ids": list(agent_data.prompt_ids),
-            "action_mask": list(agent_data.response_mask),
+            "action_mask": [0] * max(0, len(agent_data.prompt_ids) - len(agent_data.response_mask))
+            + list(agent_data.response_mask),
             "response_logprobs": list(agent_data.response_logprobs or []),
             "tool_calls": list(agent_data.segment_tool_calls.get(segment_id, [])),
             "tool_observations": list(agent_data.segment_tool_observations.get(segment_id, [])),
             "sampling_config": dict(sampling_params),
             "server_manager": self.server_manager,
         }
+        # Artifacts belong to one event boundary and are consumed once. Never
+        # reuse a request-wide bundle at a later boundary.
+        runtime_artifacts = getattr(agent_data, "segment_runtime_artifacts", {}).pop(segment_id, None)
+        if segment_id in agent_data.boundary_snapshot_errors:
+            if required:
+                raise RuntimeError(agent_data.boundary_snapshot_errors[segment_id])
+            return
         try:
-            # Providers in external harnesses commonly expose either a
-            # keyword-rich callback (``capture_boundary_state(**context)``)
-            # or a single request envelope (``capture(context)``).  Inspect
-            # the signature before invoking so a provider-side TypeError is
-            # not accidentally executed twice and the two supported shapes
-            # have identical validation and fail-closed behavior.
+            # A provider may own the runtime handles and export the three
+            # required artifact projections immediately before capture.  This
+            # hook is optional; providers that do not implement it must receive
+            # artifacts from the tool harness via tool metadata above.
+            export = getattr(provider, "export_runtime_artifacts", None)
+            if callable(export) and runtime_artifacts is None:
+                try:
+                    signature = inspect.signature(export)
+                    signature.bind(**context)
+                except (TypeError, ValueError):
+                    exported = export(context)
+                else:
+                    exported = export(**context)
+                if inspect.isawaitable(exported):
+                    exported = await exported
+                runtime_artifacts = exported
+            if runtime_artifacts is not None:
+                required_runtime = ("boundary_state", "boundary_hidden", "kernel_state")
+                if not isinstance(runtime_artifacts, Mapping) or any(
+                    not isinstance(runtime_artifacts.get(name), Mapping) or not runtime_artifacts[name]
+                    for name in required_runtime
+                ):
+                    raise TypeError("runtime_artifacts must contain nonempty boundary_state, boundary_hidden, and kernel_state mappings")
+                context["runtime_artifacts"] = deepcopy(dict(runtime_artifacts))
+            # Bind before calling so a provider-side TypeError is not retried.
             try:
                 signature = inspect.signature(capture)
                 signature.bind(**context)
@@ -819,10 +856,27 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.segment_tool_observations = segment_tool_observations
             segment_tool_observations.setdefault(segment_id, []).append(tool_response.text or "")
             if isinstance(tool_metadata, dict):
-                # A stateful science tool may return its durable checkpoint
-                # projection together with the observation.  This is the
-                # serializable path used by Ray/dataset rollouts; bare state
-                # IDs are rejected by ``validate_boundary_snapshot``.
+                runtime_artifacts = tool_metadata.get("runtime_artifacts")
+                if runtime_artifacts is not None:
+                    artifacts_by_segment = getattr(agent_data, "segment_runtime_artifacts", None)
+                    if artifacts_by_segment is None:
+                        artifacts_by_segment = {}
+                        agent_data.segment_runtime_artifacts = artifacts_by_segment
+                    reason = None
+                    if not isinstance(runtime_artifacts, Mapping):
+                        reason = "runtime_artifacts_invalid:not_mapping"
+                    elif segment_id in artifacts_by_segment:
+                        # A single provider must export the combined runtime
+                        # after parallel tool calls; last-writer-wins could
+                        # silently discard another kernel's state.
+                        reason = "runtime_artifacts_invalid:multiple_bundles_for_boundary"
+                    if reason:
+                        agent_data.boundary_snapshot_errors[segment_id] = reason
+                        if getattr(agent_data, "require_boundary_snapshots", False):
+                            raise RuntimeError(reason)
+                    else:
+                        artifacts_by_segment[segment_id] = deepcopy(dict(runtime_artifacts))
+                # A tool can alternatively return a complete snapshot.
                 snapshot = tool_metadata.get("boundary_snapshot")
                 if snapshot is not None:
                     try:

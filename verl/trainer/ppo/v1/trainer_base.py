@@ -18,6 +18,7 @@ import math
 import os
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -874,6 +875,7 @@ class PPOTrainer(ABC):
         self.global_steps = 0
         self._pending_polyseg_controller_state = None
         self._pending_science_dual_state = None
+        self._pending_science_checkpoint_state = None
 
         # A trainer instance owns the process-local fallback registry. Clear
         # it before either starting fresh or loading a checkpoint; otherwise a
@@ -926,6 +928,10 @@ class PPOTrainer(ABC):
         if os.path.exists(science_dual_state_path):
             self._pending_science_dual_state = torch.load(science_dual_state_path, weights_only=False)
             logger.info(f"Loaded pending PolySeg-Sci dual state from {science_dual_state_path}")
+        science_checkpoint_path = os.path.join(global_step_folder, "science_checkpoint.pt")
+        if os.path.exists(science_checkpoint_path):
+            self._pending_science_checkpoint_state = torch.load(science_checkpoint_path, weights_only=False)
+            logger.info(f"Loaded pending complete PolySeg-Sci state from {science_checkpoint_path}")
 
         # PolySeg's accumulating ridge estimator is trainer state in addition
         # to actor/critic weights. Restore it before processing the first
@@ -1046,6 +1052,14 @@ class PPOTrainer(ABC):
                 raise RuntimeError("checkpoint contains science dual state but manager cannot restore it")
             setter(science_state)
             self._pending_science_dual_state = None
+        science_checkpoint = getattr(self, "_pending_science_checkpoint_state", None)
+        if science_checkpoint is not None:
+            setter = getattr(manager, "set_science_checkpoint_state", None)
+            if setter is None:
+                raise RuntimeError("checkpoint contains complete science state but manager cannot restore it")
+            setter(science_checkpoint)
+            self._pending_science_checkpoint_state = None
+            logger.info("Restored complete PolySeg-Sci checkpoint state")
 
     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""
@@ -1164,6 +1178,18 @@ class PPOTrainer(ABC):
             state_dict = science_dual_state.state_dict() if hasattr(science_dual_state, "state_dict") else science_dual_state
             torch.save(state_dict, os.path.join(local_global_step_folder, "science_dual_state.pt"))
             logger.info("Saved PolySeg-Sci constraint dual state")
+        science_manager = getattr(self, "agent_loop_manager", None)
+        science_state_getter = getattr(science_manager, "get_science_checkpoint_state", None)
+        if callable(science_state_getter):
+            science_state = science_state_getter()
+            if science_state is not None:
+                if hasattr(science_state, "complete") and not science_state.complete:
+                    raise RuntimeError(
+                        "PolySeg-Sci checkpoint is incomplete: register a fitted predictor, evaluator hashes, and RNG state"
+                    )
+                state_dict = science_state.state_dict() if hasattr(science_state, "state_dict") else science_state
+                torch.save(state_dict, os.path.join(local_global_step_folder, "science_checkpoint.pt"))
+                logger.info("Saved complete PolySeg-Sci checkpoint state")
 
         # The selector state is checkpointed by torch; the shared reward ledger
         # is a separate process-safe JSON file.  Store an exact snapshot beside
@@ -2176,6 +2202,60 @@ class PPOTrainer(ABC):
                 extra_items = raw_extra_fields.tolist() if hasattr(raw_extra_fields, "tolist") else list(raw_extra_fields)
             except (TypeError, ValueError):
                 extra_items = []
+            if self.config.algorithm.adv_estimator == "polyseg_sci" and batch.partition_id != "val":
+                science_manager = getattr(self, "agent_loop_manager", None)
+                science_runtime = getattr(science_manager, "science_runtime", None)
+                if science_runtime is not None:
+                    has_prior_payload = any(
+                        isinstance(item, Mapping)
+                        and any(
+                            key in item
+                            for key in (
+                                "science_prior_rollouts",
+                                "science_prior_records",
+                                "terminal_endpoint_observations",
+                                "boundary_endpoint_observations",
+                            )
+                        )
+                        for item in extra_items
+                    )
+                    if has_prior_payload or not science_runtime.fitted:
+                        selected_group_by = str(
+                            science_manager._config_value(
+                                science_manager._science_config(self.config),
+                                "cross_fit_by",
+                                "trajectory",
+                            )
+                        ).replace("none", "trajectory")
+                        cross_fit = str(
+                            science_manager._config_value(
+                                science_manager._science_config(self.config),
+                                "cross_fit_by",
+                                "trajectory",
+                            )
+                        ) != "none"
+                        fit_on_prior_batches = bool(
+                            science_manager._config_value(
+                                science_manager._science_config(self.config),
+                                "fit_on_prior_batches",
+                                True,
+                            )
+                        )
+                        if science_runtime.fitted and has_prior_payload and fit_on_prior_batches:
+                            science_runtime.refresh_from_prior_rollout_extra_fields(
+                                extra_items,
+                                group_by=selected_group_by,
+                                cross_fit=cross_fit,
+                            )
+                            science_manager.science_checkpoint_state = science_runtime.checkpoint_state()
+                        elif not science_runtime.fitted:
+                            science_runtime.ingest_prior_rollout_extra_fields(
+                                extra_items,
+                                group_by=selected_group_by,
+                                fit=not science_runtime.fitted,
+                                cross_fit=cross_fit,
+                            )
+                            science_manager.science_checkpoint_state = science_runtime.checkpoint_state()
             accounting_keys = (
                 "segment_query_cost",
                 "segment_query_count",

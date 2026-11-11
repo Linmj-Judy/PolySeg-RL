@@ -12,6 +12,7 @@ from verl.trainer.ppo.polyseg import (
     MLPSegmentCritic,
     PolynomialSegmentCritic,
     PolynomialTransitionEstimator,
+    MacroLSVIPlanner,
     BudgetedPolySegController,
     macro_bellman_backup,
     macro_return_targets,
@@ -1408,6 +1409,50 @@ def test_transition_estimator_macro_ratio_and_suffix_budget():
     rewards = collector.collect(["good", "bad"])
     assert torch.allclose(rewards, torch.tensor([1.0, -1.0]))
     assert budget.remaining == pytest.approx(0.0)
+
+
+def test_macro_lsvi_planner_selects_finite_actions_and_round_trips_state():
+    """Macro-MDP planning must expose auditable optimistic action choices."""
+    torch.manual_seed(7)
+    n, stages, actions = 64, 2, 2
+    current = torch.where(torch.rand(n, stages, 1) > 0.5, 0.75, -0.75)
+    next_features = torch.roll(current, shifts=-1, dims=1)
+    next_action_features = torch.zeros(n, stages, actions, 1)
+    next_action_features[:, :, 0, 0] = -0.75
+    next_action_features[:, :, 1, 0] = 0.75
+    rewards = current.squeeze(-1) * 0.5 + 0.5
+    planner = MacroLSVIPlanner(
+        q=1,
+        feature_dim=1,
+        stages=stages,
+        actions=actions,
+        ridge_lambda=1e-3,
+        transition_ridge_lambda=1e-3,
+        reward_confidence_beta=0.0,
+        transition_confidence_beta=0.0,
+    )
+    planner.fit(current, rewards, next_features, next_action_features)
+    candidates = next_action_features[0]
+    plan = planner.plan(candidates)
+    assert plan.q_values.shape == (stages, 1, actions)
+    assert plan.values.shape == (stages, 1)
+    assert plan.actions.shape == (stages, 1)
+    assert plan.actions[0, 0].item() == 1
+    restored = MacroLSVIPlanner.from_state_dict(planner.state_dict())
+    restored_plan = restored.plan(candidates)
+    assert torch.equal(restored_plan.actions, plan.actions)
+    assert torch.allclose(restored_plan.q_values, plan.q_values)
+
+
+def test_macro_lsvi_planner_requires_successor_action_features():
+    planner = MacroLSVIPlanner(q=0, feature_dim=1, stages=1, actions=2)
+    with pytest.raises(ValueError, match="next_action_features"):
+        planner.fit(
+            torch.zeros(2, 1, 1),
+            torch.zeros(2, 1),
+            torch.zeros(2, 1, 1),
+            torch.zeros(2, 1, 1),
+        )
 
 
 def test_transition_estimator_fits_pv_directly_for_nonlinear_value():

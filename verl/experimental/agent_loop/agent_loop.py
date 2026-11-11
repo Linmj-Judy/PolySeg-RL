@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import random
+from types import SimpleNamespace
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any, ClassVar, Optional
@@ -57,11 +58,26 @@ from verl.trainer.ppo.polyseg import (
     load_frozen_representation,
     resolve_polyseg_option,
 )
-from verl.trainer.ppo.polyseg_sci import ConstraintDualState, _science_objective_mode, load_endpoint_schema
+from verl.trainer.ppo.polyseg_sci import (
+    ConstraintDualState,
+    ScienceCheckpointState,
+    BudgetLedger,
+    DurableBudgetLedger,
+    ScienceDependenceState,
+    PolySegScienceRuntime,
+    _science_objective_mode,
+    load_feature_map_contract,
+    load_fidelity_feature_map_contract,
+    load_endpoint_schema,
+    prior_rollout_records_from_extra_fields,
+)
 from verl.trainer.ppo.polyseg_sci_provider import (
     ScienceRoundRequest,
     attach_science_response,
+    attach_science_response_to_batch,
     load_science_round_provider,
+    materialize_science_batch_fields,
+    science_execution_owner,
 )
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -836,7 +852,15 @@ class AgentLoopWorker:
         # and the TransferQueue adapter.  Keep the provider explicit and
         # fail closed when science is enabled without a configured harness;
         # disabled scalar PolySeg runs still take the zero-cost ``None`` path.
-        self.science_round_provider = load_science_round_provider(config)
+        self.science_execution_owner = science_execution_owner(config)
+        # Driver-owned execution is intentionally absent from workers.  This
+        # prevents every Ray worker from independently mutating the sampler,
+        # dependence diagnostics, or global budget ledger.
+        self.science_round_provider = (
+            load_science_round_provider(config)
+            if self.science_execution_owner == "worker"
+            else None
+        )
         # Boundary snapshots are worker-owned runtime artifacts. Keep the
         # provider handle out of dataset metadata and inject it into each
         # tool-agent loop instance alongside the science provider seam.
@@ -1777,13 +1801,31 @@ class AgentLoopManager:
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
+        self.science_execution_owner = science_execution_owner(config)
+        self.science_round_provider = (
+            load_science_round_provider(config)
+            if self.science_execution_owner == "driver"
+            else None
+        )
+
         # PolySeg-Sci constraint multipliers live on the driver alongside the
         # adaptive selector.  Rollout workers only receive serialized values;
         # they must never create worker-local dual states because that would
         # make the primal/dual update depend on worker count and scheduling.
         self.science_endpoint_schema = None
         self.science_dual_state: ConstraintDualState | None = None
+        # The harness may register the frozen predictor, sampler history,
+        # ledger, and audit provenance here.  Trainer checkpoints serialize
+        # this complete object; workers receive only its derived rollout
+        # fields and never own mutable scientific state.
+        self.science_checkpoint_state: ScienceCheckpointState | None = None
+        self.science_runtime: PolySegScienceRuntime | None = None
         self._initialize_science_dual_state(config)
+        self._initialize_science_checkpoint_state(config)
+        if self.science_round_provider is not None and self.science_runtime is not None:
+            binder = getattr(self.science_round_provider, "bind_runtime", None)
+            if callable(binder):
+                binder(self.science_runtime)
 
         # The adaptive selector is deliberately driver-side. Rollout workers
         # process chunks independently, so a worker-local ledger would multiply
@@ -1909,6 +1951,96 @@ class AgentLoopManager:
             initial_multipliers=initial,
         )
 
+    def _initialize_science_checkpoint_state(self, config: Any) -> None:
+        """Create the driver state envelope when contracts are configured.
+
+        A feature map and finite training budget are mandatory for an
+        auto-created envelope.  Harnesses that fit a predictor later can use
+        ``register_science_checkpoint_state`` to replace the empty predictor
+        slot while retaining this schema-bound ownership on the driver.
+        """
+
+        science = self._science_config(config)
+        algorithm = self._config_value(config, "algorithm", None)
+        enabled = self._config_value(science, "enabled", False)
+        adv_estimator = self._config_value(algorithm, "adv_estimator", None)
+        if not (enabled or adv_estimator == "polyseg_sci"):
+            return
+        if self.science_endpoint_schema is None:
+            schema_path = str(self._config_value(science, "endpoint_schema_path", "") or "").strip()
+            if not schema_path:
+                return
+            schema = load_endpoint_schema(schema_path)
+            configured_hash = self._config_value(science, "endpoint_schema_hash", "")
+            if configured_hash and str(configured_hash) != schema.fingerprint:
+                raise ValueError("PolySeg-Sci endpoint schema hash does not match endpoint_schema_path")
+            self.science_endpoint_schema = schema
+        feature_path = str(self._config_value(science, "feature_map_path", "") or "").strip()
+        fidelity_path = str(self._config_value(science, "fidelity_feature_map_path", "") or "").strip()
+        fidelity_hash = str(self._config_value(science, "fidelity_feature_map_hash", "") or "").strip()
+        if fidelity_hash and not fidelity_path:
+            raise ValueError(
+                "PolySeg-Sci fidelity_feature_map_hash requires fidelity_feature_map_path"
+            )
+        fidelity_feature_map = None
+        if fidelity_path:
+            fidelity_feature_map = load_fidelity_feature_map_contract(
+                fidelity_path,
+                expected_hash=fidelity_hash or None,
+            )
+        budget = self._config_value(science, "train_budget", None)
+        if not feature_path or budget is None:
+            # Keep the legacy/probe configuration usable, but do not pretend
+            # its checkpoint is research complete.  The production harness
+            # must register a complete state before requesting eligibility.
+            return
+        feature_map = load_feature_map_contract(
+            feature_path,
+            expected_hash=self._config_value(science, "feature_map_hash", "") or None,
+        )
+        evaluator_hashes = {
+            endpoint.endpoint_id: next(
+                fidelity.evaluator_version
+                for fidelity in endpoint.fidelities
+                if fidelity.fidelity_id == endpoint.hf_fidelity_id
+            )
+            for endpoint in self.science_endpoint_schema.endpoints
+            if not endpoint.proxy_only
+        }
+        ledger_path = str(self._config_value(science, "ledger_path", "") or "").strip()
+        ledger = (
+            DurableBudgetLedger(float(budget), ledger_path)
+            if ledger_path
+            else BudgetLedger(float(budget))
+        )
+        self.science_checkpoint_state = ScienceCheckpointState(
+            schema=self.science_endpoint_schema,
+            feature_map=feature_map,
+            fidelity_feature_map=fidelity_feature_map,
+            ledger=ledger,
+            dual_state=self.science_dual_state,
+            dependence=ScienceDependenceState(hac_lag=2, block_size=1),
+            evaluator_hashes=evaluator_hashes,
+            rng_state=ScienceCheckpointState.capture_rng_state(),
+        )
+
+    def _validate_configured_fidelity_feature_map(self, actual: Any) -> None:
+        """Fail closed when a registered runtime drifts from configured LF/MF normalization."""
+
+        science = self._science_config(self.config)
+        path = str(self._config_value(science, "fidelity_feature_map_path", "") or "").strip()
+        configured_hash = str(self._config_value(science, "fidelity_feature_map_hash", "") or "").strip()
+        if configured_hash and not path:
+            raise ValueError(
+                "PolySeg-Sci fidelity_feature_map_hash requires fidelity_feature_map_path"
+            )
+        if not path:
+            return
+        expected = load_fidelity_feature_map_contract(path, expected_hash=configured_hash or None)
+        actual_hash = getattr(actual, "fingerprint", "") if actual is not None else ""
+        if actual_hash != expected.fingerprint:
+            raise ValueError("registered PolySeg-Sci runtime fidelity feature map does not match configured contract")
+
     def set_science_dual_state(self, payload: Any) -> ConstraintDualState:
         """Restore a schema-bound dual state from a checkpoint payload."""
 
@@ -1925,6 +2057,132 @@ class AgentLoopManager:
             raise RuntimeError("science dual state cannot be restored without an endpoint schema")
         self.science_dual_state = ConstraintDualState.from_state_dict(self.science_endpoint_schema, payload)
         return self.science_dual_state
+
+    def set_science_checkpoint_state(self, payload: Any) -> ScienceCheckpointState:
+        """Install a complete schema-bound Sci state restored by a trainer."""
+
+        if isinstance(payload, ScienceCheckpointState):
+            state = payload
+        else:
+            state = ScienceCheckpointState.from_state_dict(payload)
+        if self.science_endpoint_schema is not None and state.schema.fingerprint != self.science_endpoint_schema.fingerprint:
+            raise ValueError("science checkpoint schema does not match the configured endpoint schema")
+        self._validate_configured_fidelity_feature_map(state.fidelity_feature_map)
+        self.science_endpoint_schema = state.schema
+        self.science_checkpoint_state = state
+        self.science_runtime = PolySegScienceRuntime.from_checkpoint(state.state_dict()) if state.complete else None
+        if self.science_round_provider is not None and self.science_runtime is not None:
+            binder = getattr(self.science_round_provider, "bind_runtime", None)
+            if callable(binder):
+                binder(self.science_runtime)
+        if state.dual_state is not None:
+            self.science_dual_state = state.dual_state
+        return state
+
+    def get_science_checkpoint_state(self) -> ScienceCheckpointState | None:
+        """Return the registered complete Sci state for checkpoint save."""
+
+        if self.science_runtime is not None:
+            return self.science_runtime.checkpoint_state()
+        state = self.science_checkpoint_state
+        if state is None:
+            return None
+        # Keep the dual object synchronized with the manager's driver-side
+        # update path before serializing the bundle.
+        state.dual_state = self.science_dual_state
+        return state
+
+    # Explicitly named registration seam for rollout/application harnesses.
+    # It is intentionally separate from set_* so a live run cannot confuse
+    # installing a freshly fitted state with restoring an on-disk payload.
+    def register_science_checkpoint_state(self, state: ScienceCheckpointState) -> ScienceCheckpointState:
+        if not isinstance(state, ScienceCheckpointState):
+            raise TypeError("registered science checkpoint state must be ScienceCheckpointState")
+        if self.science_endpoint_schema is not None and state.schema.fingerprint != self.science_endpoint_schema.fingerprint:
+            raise ValueError("registered science checkpoint schema does not match configured endpoint schema")
+        self._validate_configured_fidelity_feature_map(state.fidelity_feature_map)
+        self.science_endpoint_schema = state.schema
+        self.science_checkpoint_state = state
+        self.science_runtime = PolySegScienceRuntime.from_checkpoint(state.state_dict()) if state.complete else None
+        if self.science_round_provider is not None and self.science_runtime is not None:
+            binder = getattr(self.science_round_provider, "bind_runtime", None)
+            if callable(binder):
+                binder(self.science_runtime)
+        if state.dual_state is not None:
+            self.science_dual_state = state.dual_state
+        return state
+
+    def register_science_runtime(self, runtime: PolySegScienceRuntime) -> ScienceCheckpointState:
+        """Register the fitted driver-side runtime used by science rounds."""
+
+        if not isinstance(runtime, PolySegScienceRuntime):
+            raise TypeError("registered science runtime must be PolySegScienceRuntime")
+        if self.science_endpoint_schema is not None and runtime.schema.fingerprint != self.science_endpoint_schema.fingerprint:
+            raise ValueError("registered science runtime schema does not match configured endpoint schema")
+        self._validate_configured_fidelity_feature_map(runtime.fidelity_feature_map)
+        self.science_endpoint_schema = runtime.schema
+        self.science_runtime = runtime
+        self.science_checkpoint_state = runtime.checkpoint_state()
+        self.science_dual_state = runtime.dual_state
+        if self.science_round_provider is not None:
+            binder = getattr(self.science_round_provider, "bind_runtime", None)
+            if callable(binder):
+                binder(runtime)
+        return self.science_checkpoint_state
+
+    def ingest_science_prior_rollouts(
+        self,
+        batch: Any,
+        *,
+        fit: bool = False,
+        cross_fit: bool = False,
+        group_by: str | None = None,
+        require_research_eligible: bool = True,
+        refresh: bool = False,
+    ) -> ScienceCheckpointState:
+        """Ingest training-only science records from an aggregated rollout batch.
+
+        The runtime and predictor remain driver-owned. Workers only serialize
+        their explicit science metadata into DataProto.extra_fields; this
+        method is the single manager seam that reconstructs those records and
+        updates the checkpoint state after split/held-out checks.
+        """
+
+        runtime = self.science_runtime
+        if runtime is None:
+            raise RuntimeError("PolySeg-Sci prior ingestion requires a registered fitted-capable runtime")
+        non_tensor = getattr(batch, "non_tensor_batch", None)
+        if non_tensor is None:
+            non_tensor = getattr(batch, "non_tensor_batch", {})
+        raw = non_tensor.get("extra_fields") if isinstance(non_tensor, Mapping) else None
+        if raw is None and isinstance(non_tensor, Mapping):
+            raw = non_tensor.get("tool_extra_fields")
+        if raw is None:
+            raise ValueError("science prior ingestion requires rollout extra_fields")
+        science = self._science_config(self.config)
+        configured_group_by = self._config_value(science, "cross_fit_by", "trajectory")
+        selected_group_by = configured_group_by if group_by is None else group_by
+        if selected_group_by == "none":
+            selected_group_by = "trajectory"
+        if refresh:
+            if not runtime.fitted:
+                raise RuntimeError("PolySeg-Sci prior refresh requires an initially fitted runtime")
+            runtime.refresh_from_prior_rollout_extra_fields(
+                raw,
+                group_by=selected_group_by,
+                cross_fit=cross_fit,
+                require_research_eligible=require_research_eligible,
+            )
+        else:
+            runtime.ingest_prior_rollout_extra_fields(
+                raw,
+                group_by=selected_group_by,
+                fit=fit,
+                cross_fit=cross_fit,
+                require_research_eligible=require_research_eligible,
+            )
+        self.science_checkpoint_state = runtime.checkpoint_state()
+        return self.science_checkpoint_state
 
     def update_science_dual_state(self, estimates: Any) -> torch.Tensor:
         """Apply projected dual ascent to an audited HF estimate vector."""
@@ -2087,6 +2345,47 @@ class AgentLoopManager:
             raise ValueError("rollout validate flag must be boolean")
         adaptive_choice = self._prepare_polyseg_adaptive(prompts, validate=validate)
 
+        # Prior training rows can be supplied by a replay/data harness on the
+        # prompt batch. Ingest them before dispatch so the first science round
+        # already has a frozen predictor. The post-rollout path below handles
+        # explicit prior records emitted by a provider for the next round.
+        runtime = getattr(self, "science_runtime", None)
+        if runtime is not None and not validate:
+            raw_prior = prompts.non_tensor_batch.get("extra_fields")
+            if raw_prior is None:
+                raw_prior = prompts.non_tensor_batch.get("tool_extra_fields")
+            if raw_prior is not None:
+                raw_items = raw_prior.tolist() if hasattr(raw_prior, "tolist") else list(raw_prior)
+                has_prior_payload = any(
+                    isinstance(item, Mapping)
+                    and any(
+                        key in item
+                        for key in (
+                            "science_prior_rollouts",
+                            "science_prior_records",
+                            "terminal_endpoint_observations",
+                            "boundary_endpoint_observations",
+                        )
+                    )
+                    for item in raw_items
+                )
+                fit_on_prior_batches = bool(
+                    self._config_value(
+                        self._science_config(self.config), "fit_on_prior_batches", True
+                    )
+                )
+                if has_prior_payload and (not runtime.fitted or fit_on_prior_batches):
+                    cross_fit = bool(
+                        self._config_value(self._science_config(self.config), "cross_fit_by", "trajectory")
+                        != "none"
+                    )
+                    self.ingest_science_prior_rollouts(
+                        prompts,
+                        fit=not runtime.fitted,
+                        refresh=runtime.fitted and fit_on_prior_batches,
+                        cross_fit=cross_fit,
+                    )
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
@@ -2095,6 +2394,47 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+
+        if self.science_execution_owner == "driver" and not validate:
+            await self._apply_driver_science_rounds(output, prompts=prompts)
+
+        # A harness may use the first eligible science round to provide
+        # training-only terminal HF observations. Fit the driver-owned
+        # predictor only after all worker outputs are aggregated; workers must
+        # never fit independent predictors or mutate shared checkpoint state.
+        runtime = getattr(self, "science_runtime", None)
+        if runtime is not None and not validate:
+            raw_extra = output.non_tensor_batch.get("extra_fields")
+            if raw_extra is not None:
+                raw_items = raw_extra.tolist() if hasattr(raw_extra, "tolist") else list(raw_extra)
+                has_prior_payload = any(
+                    isinstance(item, Mapping)
+                    and any(
+                        key in item
+                        for key in (
+                            "science_prior_rollouts",
+                            "science_prior_records",
+                            "terminal_endpoint_observations",
+                            "boundary_endpoint_observations",
+                        )
+                    )
+                    for item in raw_items
+                )
+                fit_on_prior_batches = bool(
+                    self._config_value(
+                        self._science_config(self.config), "fit_on_prior_batches", True
+                    )
+                )
+                if has_prior_payload and (not runtime.fitted or fit_on_prior_batches):
+                    self.ingest_science_prior_rollouts(
+                        output,
+                        fit=not runtime.fitted,
+                        refresh=runtime.fitted and fit_on_prior_batches,
+                        cross_fit=bool(
+                            self._config_value(self._science_config(self.config), "cross_fit_by", "trajectory")
+                            != "none"
+                        ),
+                    )
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
@@ -2128,6 +2468,48 @@ class AgentLoopManager:
                 "remaining_budget": remaining,
             }
         return output
+
+    async def _apply_driver_science_rounds(self, output: DataProto, *, prompts: DataProto) -> None:
+        """Execute one serialized science round per aggregated rollout row.
+
+        Workers only produce token/action and harness-owned metadata.  The
+        driver then invokes the provider in deterministic row order, so the
+        registered runtime is the sole mutable owner of sampler, dependence,
+        and budget state.  A round factory may use the wrapper's extra fields
+        and request context to bind OpenAI4S session/CAS/evaluator callbacks.
+        """
+
+        provider = self.science_round_provider
+        if provider is None:
+            raise RuntimeError("driver-owned PolySeg-Sci execution has no provider")
+        runtime = getattr(self, "science_runtime", None)
+        if runtime is None or not runtime.fitted:
+            raise RuntimeError(
+                "driver-owned PolySeg-Sci execution requires a registered fitted runtime"
+            )
+        extras = output.non_tensor_batch.get("extra_fields")
+        if extras is None or len(extras) != len(output):
+            raise ValueError("driver-owned science execution requires one extra_fields row per rollout")
+        for index in range(len(output)):
+            row = extras[index] if isinstance(extras[index], Mapping) else {}
+            wrapper = SimpleNamespace(extra_fields=dict(row))
+            request = ScienceRoundRequest(
+                output=wrapper,
+                outputs=(wrapper,),
+                validate=False,
+                context={
+                    "validate": False,
+                    "row_index": index,
+                    "batch": output,
+                    "prompts": prompts,
+                    "extra_fields": wrapper.extra_fields,
+                    "science_runtime": runtime,
+                    "science_runtime_fingerprint": runtime.checkpoint_state().fingerprint,
+                },
+            )
+            response = await provider.execute(request)
+            attach_science_response_to_batch(output, index, response)
+        materialize_science_batch_fields(output)
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
