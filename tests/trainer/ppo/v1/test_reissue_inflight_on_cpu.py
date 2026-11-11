@@ -572,6 +572,10 @@ def test_real_trainer_load_checkpoint_restores_feedback_and_transfer_queue(
                 "resume_from_path": str(checkpoint),
                 "del_local_ckpt_after_load": False,
             },
+            # _load_checkpoint reads data.custom_dataloader to decide whether
+            # dataloader-state restoration is supported. Real trainer configs
+            # always carry this node; keep the minimal test config aligned.
+            "data": {},
             "algorithm": {"polyseg": {"accumulate_estimator": False, "use_confidence_bonus": False}},
             "reward": {
                 "reward_kwargs": {
